@@ -1,7 +1,3 @@
-<<<<<<< HEAD
-# jules-orchestrator
-Async AI software factory with background tracking for Google Jules
-=======
 # Jules Orchestrator v3.0
 
 Async AI software factory with background tracking, dependency resolution, and auto-approval for Google Jules.
@@ -16,7 +12,7 @@ Converts high-level prompts into deterministic execution pipelines:
 4. **Approve** - Auto-approve valid PRs and merge to dev
 5. **Complete** - Final PR to main for human review
 
-## Installation
+## Quick Start
 
 ```bash
 # Clone the skill
@@ -41,10 +37,9 @@ jules-agent --help
 - Git
 - GitHub account with Jules access
 
-## Quick Start
+## Kilo Commands
 
-```bash
-# In Kilo, use the commands:
+```
 /plan-work "Build invoice system with PDF generation"
 /jules-verify
 /jules-start
@@ -116,7 +111,44 @@ orchestrator:
 - ✅ Resume from any point
 - ✅ State persistence
 
+## Project Status
+
+This project is actively developed. See [Roadmap](#roadmap) for upcoming features.
+
+## Roadmap
+
+### v3.0 (Current)
+- [x] Background agent with async execution
+- [x] Dependency resolver with level-order batches
+- [x] Auto-approval and auto-merge
+- [x] State persistence in JULES_MEMORY.json
+- [x] Resume from memory
+
+### v3.1 (Planned)
+- [ ] Multi-agent parallel execution
+- [ ] CI-aware validation
+- [ ] Smart retry with enhanced prompts
+- [ ] Slack/Discord notifications
+
+### v3.2 (Future)
+- [ ] Self-healing workflows
+- [ ] Context injection from previous tasks
+- [ ] Adaptive learning from failures
+- [ ] Team collaboration features
+
+## Contributing
+
+1. Fork the repository
+2. Create your feature branch (`git checkout -b feature/amazing-feature`)
+3. Commit your changes (`git commit -m 'Add amazing feature'`)
+4. Push to the branch (`git push origin feature/amazing-feature`)
+5. Open a Pull Request
+
 ## License
 
 MIT
->>>>>>> f11a0e2 (Jules Orchestrator v3.0 - Complete async implementation)
+
+## Support
+
+- GitHub Issues: https://github.com/DoozieGPT-Labs/jules-orchestrator/issues
+- Discussions: https://github.com/DoozieGPT-Labs/jules-orchestrator/discussions
