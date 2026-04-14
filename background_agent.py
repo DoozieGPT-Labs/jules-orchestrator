@@ -81,25 +81,40 @@ class JulesBackgroundAgent:
 
             time.sleep(self.check_interval)
 
-    def process_batch(self, memory: Dict):
+def process_batch(self, memory: Dict):
         """Create issues for tasks whose dependencies are complete"""
         tasks = memory.get("tasks", [])
         completed_ids = self.get_completed_task_ids(memory)
-
+        
         for task in tasks:
             if task["status"] != "pending":
                 continue
-
+            
+            # Double-check: if task already has issue_id, skip
+            if task.get("issue_id"):
+                self.logger.warning(f"Task {task['id']} already has issue #{task['issue_id']}, skipping")
+                continue
+            
             deps = task.get("dependencies", [])
             if all(d in completed_ids for d in deps):
-                self.logger.info(f"Creating issue for {task['id']}")
+                self.logger.info(f"Processing task {task['id']}")
+                
+                # Check memory for existing issue_id (extra safety)
+                memory_task = next((t for t in memory.get("tasks", []) if t["id"] == task["id"]), None)
+                if memory_task and memory_task.get("issue_id"):
+                    self.logger.warning(f"Task {task['id']} already has issue in memory, skipping")
+                    continue
+                
                 issue_id = self.create_github_issue(task)
-
+                
                 if issue_id:
                     task["status"] = "issue_created"
                     task["issue_id"] = issue_id
                     task["created_at"] = datetime.now().isoformat()
-
+                    
+                    # Save immediately to prevent duplicates
+                    self.save_memory(memory)
+                    
                     # Trigger Jules (label triggers processing)
                     self.trigger_jules(task, issue_id)
                     task["status"] = "jules_triggered"
@@ -244,8 +259,48 @@ class JulesBackgroundAgent:
 
         return True
 
+    def check_existing_issue(self, task: Dict) -> Optional[int]:
+        """Check if issue already exists for this task"""
+        try:
+            # Search for issues with this task ID
+            cmd = [
+                "gh",
+                "issue",
+                "list",
+                "-R",
+                self.repo,
+                "--state",
+                "all",
+                "--search",
+                f"[AUTO][{task['id']}]",
+                "--json",
+                "number,title,state",
+            ]
+            result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+            issues = json.loads(result.stdout)
+
+            for issue in issues:
+                if f"[{task['id']}]" in issue.get("title", ""):
+                    self.logger.info(
+                        f"Found existing issue #{issue['number']} for {task['id']}"
+                    )
+                    return issue["number"]
+
+            return None
+        except Exception as e:
+            self.logger.error(f"Error checking existing issues: {e}")
+            return None
+
     def create_github_issue(self, task: Dict, retry: bool = False) -> Optional[int]:
         """Create GitHub issue for task"""
+        # Check for existing issue first
+        existing = self.check_existing_issue(task)
+        if existing:
+            self.logger.warning(
+                f"Duplicate prevention: Issue #{existing} already exists for {task['id']}"
+            )
+            return existing
+
         retry_suffix = f" (Retry #{task.get('retry_count', 0) + 1})" if retry else ""
         title = f"[AUTO][{task['id']}] {task['title']}{retry_suffix}"
         body = self.format_issue_body(task)
@@ -268,7 +323,9 @@ class JulesBackgroundAgent:
         try:
             result = subprocess.run(cmd, capture_output=True, text=True, check=True)
             issue_url = result.stdout.strip()
-            return int(issue_url.split("/")[-1])
+            issue_number = int(issue_url.split("/")[-1])
+            self.logger.info(f"Created issue #{issue_number} for {task['id']}")
+            return issue_number
         except Exception as e:
             self.logger.error(f"Failed to create issue: {e}")
             return None
