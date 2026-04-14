@@ -1,0 +1,60 @@
+---
+name: jules-orchestrator
+version: 3.0.0
+description: Async AI software factory with background tracking and auto-approval
+
+orchestrator:
+  check_interval: 30
+  max_retries: 2
+  auto_approve: true
+  auto_merge: true
+  target_branch: dev
+  final_branch: main
+  parallel_batches: true
+  max_concurrent: 3
+  timeout_per_task: 600
+  
+github:
+  bot_username: jules-bot
+  issue_labels:
+    - jules
+    - auto-task
+  label_colors:
+    jules: 4A5ABA
+    auto-task: 0E8A16
+    db: D93F0B
+    api: FBCA04
+    ui: C5DEF5
+    test: 5319E7
+    
+planning:
+  max_tasks: 10
+  min_acceptance_criteria: 2
+  min_test_cases: 1
+  valid_types:
+    - DB
+    - API
+    - UI
+    - Refactor
+    - Test
+  
+validation:
+  require_tests: true
+  max_file_variance: 0.2
+  require_ci_pass: true
+  
+jules:
+  api_endpoint: https://jules.google/api/v1
+  retry_failed: true
+  enhance_prompts: true
+  
+memory:
+  file: JULES_MEMORY.json
+  auto_commit: true
+  commit_message_prefix: "[Jules]"
+  
+logging:
+  file: jules-agent.log
+  level: INFO
+  max_size: 10485760
+  backup_count: 5

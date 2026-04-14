@@ -1,0 +1,123 @@
+#!/usr/bin/env python3
+"""
+Jules Agent CLI - Entry point for Jules Orchestrator
+"""
+
+import argparse
+import sys
+import os
+
+# Add parent to path
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from lib.background_agent import JulesBackgroundAgent
+from lib.dependency_resolver import create_execution_plan
+from lib.resume_logic import resume_orchestration
+
+
+def cmd_start(args):
+    """Start background agent"""
+    agent = JulesBackgroundAgent(args.repo, args.memory)
+    agent.run()
+
+
+def cmd_resume(args):
+    """Resume from memory"""
+    result = resume_orchestration(args.repo, args.memory)
+    
+    if result['success']:
+        print(f"✅ Resumed: {result['summary']['progress']}")
+        if not result['agent_running']:
+            print("\nStarting background agent...")
+            agent = JulesBackgroundAgent(args.repo, args.memory)
+            agent.run()
+    else:
+        print(f"❌ {result.get('error', 'Unknown error')}")
+
+
+def cmd_status(args):
+    """Check status"""
+    result = resume_orchestration(args.repo, args.memory)
+    
+    if result.get('success'):
+        summary = result['summary']
+        print(f"\n📊 Project Status")
+        print(f"   Progress: {summary['progress']}")
+        print(f"   Completed: {summary['completed']}/{summary['total']}")
+        print(f"   Failed: {summary['failed']}")
+        print(f"   Executing: {summary['executing']}")
+        print(f"   Pending: {summary['pending']}")
+        print(f"\n   Agent: {'Running' if result.get('agent_running') else 'Stopped'}")
+        
+        if result.get('recommendations'):
+            print(f"\n💡 Recommendations:")
+            for rec in result['recommendations']:
+                print(f"   - {rec}")
+    else:
+        print(f"❌ {result.get('error', 'No active project')}")
+
+
+def cmd_plan(args):
+    """Generate plan from file"""
+    import json
+    
+    with open(args.plan_file, 'r') as f:
+        plan = json.load(f)
+    
+    result = create_execution_plan(plan.get('tasks', []))
+    
+    if result['valid']:
+        print(f"✅ Plan validated")
+        print(f"   Tasks: {len(plan['tasks'])}")
+        print(f"   Levels: {result['level_count']}")
+        print(f"   Max parallel: {result['max_parallel']}")
+        print(f"\nExecution Levels:")
+        for i, level in enumerate(result['levels']):
+            print(f"   Level {i}: {', '.join(level)}")
+    else:
+        print(f"❌ Validation failed:")
+        for error in result['errors']:
+            print(f"   - {error}")
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description='Jules Orchestrator - Async AI software factory',
+        prog='jules-agent'
+    )
+    
+    parser.add_argument('--repo', required=True, 
+                       help='GitHub repo (org/name)')
+    parser.add_argument('--memory', default='JULES_MEMORY.json',
+                       help='Memory file path')
+    
+    subparsers = parser.add_subparsers(dest='command', help='Commands')
+    
+    # start command
+    start_parser = subparsers.add_parser('start', help='Start background agent')
+    start_parser.set_defaults(func=cmd_start)
+    
+    # resume command
+    resume_parser = subparsers.add_parser('resume', help='Resume from memory')
+    resume_parser.set_defaults(func=cmd_resume)
+    
+    # status command
+    status_parser = subparsers.add_parser('status', help='Check status')
+    status_parser.set_defaults(func=cmd_status)
+    
+    # plan command
+    plan_parser = subparsers.add_parser('plan', help='Validate plan file')
+    plan_parser.add_argument('plan_file', help='Path to plan JSON')
+    plan_parser.set_defaults(func=cmd_plan)
+    
+    args = parser.parse_args()
+    
+    if not hasattr(args, 'func'):
+        parser.print_help()
+        sys.exit(1)
+    
+    args.func(args)
+
+
+if __name__ == '__main__':
+    main()
