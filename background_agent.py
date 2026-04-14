@@ -11,8 +11,14 @@ import sys
 import signal
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Dict, List, Optional, Set, Tuple, Union
 import logging
+import os
+
+# Import local modules
+sys.path.insert(0, str(Path(__file__).parent))
+from skill_detector import SkillDetector
+from pr_quality_gate import PRQualityGate
 
 
 class JulesBackgroundAgent:
@@ -27,6 +33,7 @@ class JulesBackgroundAgent:
         self.running = False
         self.check_interval = 30  # seconds
         self.logger = self._setup_logger()
+        self.quality_gate = PRQualityGate(repo)
 
     def _setup_logger(self) -> logging.Logger:
         """Setup logging"""
@@ -213,32 +220,25 @@ def process_batch(self, memory: Dict):
                 self.logger.error(f"Task {task['id']} max retries exceeded, blocking")
                 task["status"] = "blocked"
 
-    def validate_pr(self, task: Dict, pr_info: Dict) -> bool:
-        """Validate PR against task expectations"""
-        expected_files = set(task.get("files_expected", []))
-        changed_files = self.get_pr_files(pr_info["number"])
-
-        if not changed_files:
+def validate_pr(self, task: Dict, pr_info: Dict) -> bool:
+        """Validate PR using Quality Gate - returns True only if passed"""
+        pr_number = pr_info["number"]
+        
+        self.logger.info(f"Running Quality Gate on PR #{pr_number}")
+        
+        validation = self.quality_gate.validate_pr(task, pr_number)
+        
+        # Log results
+        report = self.quality_gate.generate_report(validation)
+        self.logger.info(f"Quality Gate Report:\n{report}")
+        
+        if not validation["passed"]:
+            self.logger.error(f"PR #{pr_number} FAILED Quality Gate")
+            self.logger.error(f"Errors: {validation['errors']}")
             return False
-
-        # Check files match
-        files_match = expected_files.issubset(set(changed_files))
-
-        # Check no unrelated changes (allow 20% extra)
-        extra_files = set(changed_files) - expected_files
-        no_unrelated = len(extra_files) <= len(expected_files) * 0.2
-
-        # Check tests exist
-        tests_exist = True
-        if task["type"] != "Test":
-            test_files = [
-                f
-                for f in changed_files
-                if "test" in f.lower() or "Test" in f or "spec" in f.lower()
-            ]
-            tests_exist = len(test_files) > 0
-
-        return files_match and no_unrelated and tests_exist
+        
+        self.logger.info(f"PR #{pr_number} PASSED Quality Gate (Score: {validation['score']})")
+        return True
 
     def validate_merged_pr(self, task: Dict, pr_info: Dict) -> bool:
         """Validate merged PR - check files actually in repo"""
@@ -330,8 +330,20 @@ def process_batch(self, memory: Dict):
             self.logger.error(f"Failed to create issue: {e}")
             return None
 
-    def format_issue_body(self, task: Dict) -> str:
-        """Format GitHub issue body"""
+def format_issue_body(self, task: Dict, repo_path: str = ".") -> str:
+        """Format GitHub issue body with skill injection"""
+        # Detect and inject skills
+        try:
+            detector = SkillDetector()
+            skills = detector.get_skills_for_task(task, repo_path)
+            skill_section = detector.generate_skill_prompt(skills)
+            
+            # Install skills to project for reference
+            detector.install_skills_to_project(repo_path, [s["name"] for s in skills])
+        except Exception as e:
+            self.logger.error(f"Failed to load skills: {e}")
+            skill_section = ""
+        
         body = f"""## Task Definition
 - **ID**: {task["id"]}
 - **Type**: {task["type"]}
@@ -345,21 +357,25 @@ def process_batch(self, memory: Dict):
 """
         for f in task.get("files_expected", []):
             body += f"- [ ] `{f}`\n"
-
+        
         body += "\n## Acceptance Criteria\n"
         for i, criteria in enumerate(task.get("acceptance_criteria", []), 1):
             body += f"{i}. {criteria}\n"
-
+        
         body += "\n## Test Cases\n"
         for i, test in enumerate(task.get("test_cases", []), 1):
             body += f"{i}. {test}\n"
-
+        
         deps = task.get("dependencies", [])
         if deps:
             body += f"\n## Dependencies\n"
             for dep in deps:
                 body += f"- {dep} ✅\n"
-
+        
+        # Add skill section
+        if skill_section:
+            body += f"\n## Skill Guidelines\n```\n{skill_section}\n```\n"
+        
         body += """
 ## Jules Instructions
 **CRITICAL**: Execute EXACTLY as specified. Do not expand scope.
@@ -378,10 +394,11 @@ Tests must pass before submitting PR.
         # Jules auto-processes issues with 'jules' label
         pass
 
-    def get_pr_for_task(self, task: Dict) -> Optional[Dict]:
-        """Get PR associated with task"""
+def get_pr_for_task(self, task: Dict) -> Optional[Dict]:
+        """Get PR associated with task - FIXED to search by issue reference"""
         task_id = task["id"]
-
+        issue_id = task.get("issue_id")
+        
         try:
             # Check open PRs
             result = subprocess.run(
@@ -394,18 +411,31 @@ Tests must pass before submitting PR.
                     "--state",
                     "open",
                     "--json",
-                    "number,title,state,merged",
+                    "number,title,body,headRefName",
                 ],
                 capture_output=True,
                 text=True,
                 check=True,
             )
             prs = json.loads(result.stdout)
-
+            
             for pr in prs:
-                if task_id in pr.get("title", ""):
+                # Search by: task ID in title, OR issue reference in body
+                pr_title = pr.get("title", "")
+                pr_body = pr.get("body", "")
+                branch = pr.get("headRefName", "")
+                
+                if task_id in pr_title:
                     return pr
-
+                
+                # Jules references issue in PR body: "Fixes #6"
+                if issue_id and f"#{issue_id}" in pr_body:
+                    return pr
+                
+                # Branch name may contain task info
+                if task_id.lower() in branch.lower():
+                    return pr
+            
             # Check merged PRs
             result = subprocess.run(
                 [
@@ -417,21 +447,31 @@ Tests must pass before submitting PR.
                     "--state",
                     "merged",
                     "--json",
-                    "number,title,state,merged",
+                    "number,title,body,headRefName",
                 ],
                 capture_output=True,
                 text=True,
                 check=True,
             )
             prs = json.loads(result.stdout)
-
+            
             for pr in prs:
-                if task_id in pr.get("title", ""):
+                pr_title = pr.get("title", "")
+                pr_body = pr.get("body", "")
+                branch = pr.get("headRefName", "")
+                
+                if task_id in pr_title:
                     return pr
-
+                
+                if issue_id and f"#{issue_id}" in pr_body:
+                    return pr
+                
+                if task_id.lower() in branch.lower():
+                    return pr
+            
         except Exception as e:
             self.logger.error(f"Error getting PR for task {task_id}: {e}")
-
+        
         return None
 
     def get_pr_files(self, pr_number: int) -> List[str]:

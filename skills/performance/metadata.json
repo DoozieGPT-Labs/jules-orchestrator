@@ -1,0 +1,22 @@
+{
+  "name": "performance",
+  "version": "1.0.0",
+  "description": "Performance optimization patterns",
+  "triggers": {
+    "files": ["*.php", "database/"],
+    "task_types": ["API", "DB"]
+  },
+  "applies_to": ["Laravel", "PHP"],
+  "dependencies": ["logging"],
+  "priority": 6,
+  "constraints": [
+    {
+      "rule": "Must eager load relationships",
+      "severity": "warning"
+    },
+    {
+      "rule": "Should cache expensive queries",
+      "severity": "suggestion"
+    }
+  ]
+}
