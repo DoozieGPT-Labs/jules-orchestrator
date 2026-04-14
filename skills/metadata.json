@@ -1,0 +1,55 @@
+{
+  "version": "1.0.0",
+  "skills": [
+    {
+      "name": "backend-api",
+      "description": "Backend API patterns and Laravel controller conventions",
+      "triggers": ["*.php", "Controller", "routes/api.php"],
+      "applies_to": ["API", "backend"],
+      "dependencies": ["logging", "error-handling"],
+      "priority": 10,
+      "enabled": true
+    },
+    {
+      "name": "db-design",
+      "description": "Database migration and model design patterns",
+      "triggers": ["database/migrations/*", "*.php"],
+      "applies_to": ["DB"],
+      "dependencies": [],
+      "priority": 10,
+      "enabled": true
+    },
+    {
+      "name": "testing",
+      "description": "Unit and feature testing patterns",
+      "triggers": ["*Test.php", "tests/", "phpunit"],
+      "applies_to": ["Test"],
+      "dependencies": [],
+      "priority": 8,
+      "enabled": true
+    },
+    {
+      "name": "security",
+      "description": "Security best practices and validation",
+      "triggers": ["*Request.php", "auth", "validation"],
+      "applies_to": ["API", "UI"],
+      "dependencies": [],
+      "priority": 9,
+      "enabled": true
+    },
+    {
+      "name": "logging",
+      "description": "Structured logging and error tracking",
+      "triggers": ["*.php", "app/"],
+      "applies_to": ["API", "DB", "UI"],
+      "dependencies": [],
+      "priority": 5,
+      "enabled": true
+    }
+  ],
+  "rules": {
+    "max_skills_per_task": 5,
+    "auto_detect": true,
+    "resolve_conflicts_by_priority": true
+  }
+}

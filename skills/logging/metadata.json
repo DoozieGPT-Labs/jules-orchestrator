@@ -1,0 +1,13 @@
+{
+  "name": "logging",
+  "version": "1.0.0",
+  "description": "Structured logging and error tracking",
+  "triggers": {
+    "files": ["*.php", "app/"],
+    "task_types": ["API", "DB", "UI"]
+  },
+  "applies_to": ["Laravel", "PHP"],
+  "dependencies": [],
+  "priority": 5,
+  "constraints": []
+}

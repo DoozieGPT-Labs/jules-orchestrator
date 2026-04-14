@@ -1,0 +1,30 @@
+{
+  "name": "backend-api",
+  "version": "1.0.0",
+  "description": "Laravel backend API patterns and conventions",
+  "triggers": {
+    "files": ["*.php", "Controller.php", "routes/api.php"],
+    "task_types": ["API"]
+  },
+  "applies_to": ["Laravel", "PHP"],
+  "dependencies": ["logging"],
+  "priority": 10,
+  "constraints": [
+    {
+      "rule": "Must use Form Request validation",
+      "severity": "error"
+    },
+    {
+      "rule": "Must return JsonResponse",
+      "severity": "error"
+    },
+    {
+      "rule": "Must type-hint parameters",
+      "severity": "warning"
+    },
+    {
+      "rule": "Must handle 404 errors",
+      "severity": "error"
+    }
+  ]
+}

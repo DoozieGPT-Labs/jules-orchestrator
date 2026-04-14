@@ -1,0 +1,26 @@
+{
+  "name": "security",
+  "version": "1.0.0",
+  "description": "Security best practices and validation",
+  "triggers": {
+    "files": ["*Request.php", "auth", "validation"],
+    "task_types": ["API", "UI"]
+  },
+  "applies_to": ["Laravel", "PHP"],
+  "dependencies": ["logging"],
+  "priority": 9,
+  "constraints": [
+    {
+      "rule": "Must validate all input",
+      "severity": "error"
+    },
+    {
+      "rule": "Must check authorization",
+      "severity": "error"
+    },
+    {
+      "rule": "No raw SQL queries",
+      "severity": "error"
+    }
+  ]
+}
