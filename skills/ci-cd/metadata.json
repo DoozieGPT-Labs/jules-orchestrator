@@ -1,0 +1,10 @@
+{
+  "name": "ci-cd",
+  "description": "GitHub Actions, deployment pipelines, and DevOps automation",
+  "version": "1.0.0",
+  "triggers": [".github/workflows/", "Dockerfile", "docker-compose", "deploy", "CI/CD"],
+  "applies_to": ["devops", "deployment", "automation"],
+  "dependencies": ["testing", "security"],
+  "priority": 7,
+  "enabled": true
+}

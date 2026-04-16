@@ -1,0 +1,10 @@
+{
+  "name": "frontend-react",
+  "description": "React component patterns, hooks, and modern frontend architecture",
+  "version": "1.0.0",
+  "triggers": ["*.tsx", "*.jsx", "React", "useEffect", "useState", "components/"],
+  "applies_to": ["frontend", "UI", "web"],
+  "dependencies": ["error-handling", "testing"],
+  "priority": 9,
+  "enabled": true
+}

@@ -10,9 +10,7 @@ import os
 # Add parent to path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from lib.background_agent import JulesBackgroundAgent
-from lib.dependency_resolver import create_execution_plan
-from lib.resume_logic import resume_orchestration
+from lib import JulesBackgroundAgent, create_execution_plan, resume_orchestration
 
 
 def cmd_start(args):

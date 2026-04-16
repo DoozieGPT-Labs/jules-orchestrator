@@ -13,7 +13,7 @@ with open(os.path.join(here, "SKILL.md"), "r") as f:
 
 setup(
     name="jules-orchestrator",
-    version="3.0.0",
+    version="3.0.1",
     description="Async AI software factory with background tracking for Google Jules",
     long_description=long_description,
     long_description_content_type="text/markdown",

@@ -1,0 +1,10 @@
+{
+  "name": "error-handling",
+  "description": "Exception handling, error responses, and graceful degradation patterns",
+  "version": "1.0.0",
+  "triggers": ["try/catch", "Exception", "throw", "error", "Handler.php"],
+  "applies_to": ["API", "backend", "frontend"],
+  "dependencies": ["logging"],
+  "priority": 8,
+  "enabled": true
+}

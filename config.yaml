@@ -1,7 +1,7 @@
 ---
 name: jules-orchestrator
-version: 3.0.0
-description: Async AI software factory with background tracking and auto-approval
+version: 3.0.3
+description: Async AI software factory with ML-based predictions, auto-scaling, and self-healing - Phase 3 Complete
 
 orchestrator:
   check_interval: 30
