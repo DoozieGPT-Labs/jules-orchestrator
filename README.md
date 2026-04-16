@@ -1,8 +1,8 @@
-# Jules Orchestrator v3.0.3
+# Jules Orchestrator v4.0.0
 
 > Async AI software factory with ML-based predictions, circuit breakers, auto-scaling, and self-healing workflows.
 
-[![Version](https://img.shields.io/badge/version-3.0.3-blue.svg)](https://github.com/DoozieGPT-Labs/jules-orchestrator)
+[![Version](https://img.shields.io/badge/version-4.0.0-blue.svg)](https://github.com/DoozieGPT-Labs/jules-orchestrator)
 [![Python](https://img.shields.io/badge/python-3.8+-blue.svg)](https://python.org)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 
@@ -69,7 +69,7 @@ echo 'export PATH="$HOME/.config/kilo/skill/jules-orchestrator/bin:$PATH"' >> ~/
 source ~/.zshrc
 
 # Verify installation
-jules-agent --version  # Should show 3.0.3
+jules-agent --version  # Should show 4.0.0
 ```
 
 ### System Requirements
@@ -116,7 +116,7 @@ You'll be prompted for:
 
 Output:
 ```
-📊 Project: auth-service (v3.0.3)
+📊 Project: auth-service (v4.0.0)
 Progress: 4/6 tasks (67%)
 
 ✅ Completed:
@@ -185,7 +185,7 @@ logging:
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│                    Jules Orchestrator v3.0.3                │
+│                    Jules Orchestrator v4.0.0                │
 ├─────────────────────────────────────────────────────────────┤
 │  Phase 3: Optimization                                      │
 │  ├── Failure Predictor (ML risk scoring)                    │
@@ -227,7 +227,7 @@ logging:
 
 ## 🛣️ Roadmap
 
-### v3.0.3 (Current) ✅
+### v4.0.0 (Current) ✅
 - ✅ ML-based failure prediction
 - ✅ Auto-scaling with smart batching
 - ✅ Self-healing workflows
@@ -274,4 +274,4 @@ MIT License - see [LICENSE](LICENSE) for details.
 
 **Made with ❤️ by the DoozieGPT Labs team**
 
-*Last updated: 2026-04-17 | Version 3.0.3*
+*Last updated: 2026-04-17 | Version 4.0.0*

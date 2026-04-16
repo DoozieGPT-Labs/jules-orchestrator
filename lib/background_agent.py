@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Jules Background Agent v3.0.1 - Phase 1 Stabilization
+Jules Background Agent v4.0.0 - Phase 1 Stabilization
 Continuous monitoring and orchestration with idempotency and state machine
 """
 

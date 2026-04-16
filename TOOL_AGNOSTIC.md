@@ -2,7 +2,7 @@
 
 > Use Jules Orchestrator with any AI coding assistant
 
-Jules Orchestrator v3.0.3+ includes a **tool-agnostic adapter system** that automatically detects which AI coding assistant you're using and adapts commands accordingly.
+Jules Orchestrator v4.0.0+ includes a **tool-agnostic adapter system** that automatically detects which AI coding assistant you're using and adapts commands accordingly.
 
 ## Supported Tools
 
@@ -378,7 +378,7 @@ User: /plan-work "Build a user authentication system"
 [Detected: Kilo environment]
 [Translated to: /plan-work command]
 
-Agent: 🚀 Jules Orchestrator v3.0.3
+Agent: 🚀 Jules Orchestrator v4.0.0
        Detected: Kilo
 
        Step 1/7: Interactive Setup
@@ -396,7 +396,7 @@ User: @jules plan-work "Build a user authentication system"
 [Detected: OpenCode environment]
 [Translated to: Python execution]
 
-Agent: 🚀 Jules Orchestrator v3.0.3
+Agent: 🚀 Jules Orchestrator v4.0.0
        Detected: OpenCode
 
        Running: python3 ~/.opencode/extensions/jules-orchestrator/...
@@ -413,7 +413,7 @@ User: Jules: plan work for "Build a user authentication system"
 [Detected: Claude Code environment]
 [Translated to: CLI execution]
 
-Agent: 🚀 Jules Orchestrator v3.0.3
+Agent: 🚀 Jules Orchestrator v4.0.0
        Detected: Claude Code
        
        Executing: jules plan "Build a user authentication system"
@@ -427,7 +427,7 @@ Agent: 🚀 Jules Orchestrator v3.0.3
 ```bash
 $ jules plan "Build a user authentication system" --repo my-org/auth-service
 
-🚀 Jules Orchestrator v3.0.3
+🚀 Jules Orchestrator v4.0.0
    Detected: Generic CLI
 
 Planning work for: my-org/auth-service

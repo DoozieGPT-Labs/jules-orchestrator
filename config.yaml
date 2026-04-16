@@ -1,7 +1,7 @@
 ---
 name: jules-orchestrator
-version: 3.0.3
-description: Async AI software factory with ML-based predictions, auto-scaling, and self-healing - Phase 3 Complete
+version: 4.0.0
+description: Universal AI software factory - Tool-agnostic orchestration across Kilo, OpenCode, Claude Code, Cursor, and CLI
 
 orchestrator:
   check_interval: 30

@@ -55,7 +55,7 @@ chmod +x install.sh
 
 # Verify installation
 jules-agent --version
-# ✅ Jules Orchestrator v3.0.3
+# ✅ Jules Orchestrator v4.0.0
 ```
 
 ### Option 2: Kilo Integration
@@ -127,7 +127,7 @@ Check status anytime:
 
 **Example output:**
 ```
-🚀 Jules Orchestrator v3.0.3
+🚀 Jules Orchestrator v4.0.0
 📊 Project: book-api
 Progress: 3/6 tasks (50%)
 Health: ✅ Healthy | Risk: Low

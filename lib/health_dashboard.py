@@ -56,7 +56,7 @@ class HealthDashboard:
         """Generate full health dashboard"""
         dashboard = {
             "generated_at": datetime.now().isoformat(),
-            "version": "3.0.2",
+            "version": "4.0.0",
             "repo": self.repo,
             "status": "healthy",  # Will be updated based on checks
             "checks": {},
