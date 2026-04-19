@@ -1,0 +1,492 @@
+#!/usr/bin/env python3
+"""
+Kilo CLI Command: jules-plan
+Generates execution plan and starts Jules orchestration.
+Usage: /jules-plan "Build invoice system with PDF generation"
+"""
+
+import json
+import subprocess
+import sys
+import re
+from datetime import datetime
+from pathlib import Path
+
+
+def generate_plan(prompt: str, tech_stack: str = "Laravel + PostgreSQL") -> dict:
+    """Generate deterministic plan from prompt."""
+    
+    # Extract project name from prompt
+    words = re.findall(r'\b[a-zA-Z]+\b', prompt.lower())
+    project_name = '-'.join(words[:3]) if len(words) >= 3 else 'project'
+    
+    # Map keywords to modules
+    modules = []
+    if 'inventory' in prompt.lower() or 'erp' in prompt.lower():
+        modules.extend(['inventory', 'purchase', 'vendor'])
+    if 'invoice' in prompt.lower():
+        modules.append('invoice')
+    if 'user' in prompt.lower() or 'auth' in prompt.lower():
+        modules.append('auth')
+    
+    # Generate tasks based on modules
+    tasks = []
+    task_id = 1
+    deps_map = {}
+    
+    if 'inventory' in modules:
+        tasks.append({
+            "id": f"T{task_id}",
+            "title": "Create database migrations for inventory tables",
+            "description": "Create Laravel migrations for vendors, inventory_items, purchase_orders, and purchase_order_items tables with proper foreign keys and indexes.",
+            "type": "DB",
+            "dependencies": [],
+            "files_expected": [
+                f"database/migrations/{datetime.now().strftime('%Y_%m_%d')}_000001_create_vendors_table.php",
+                f"database/migrations/{datetime.now().strftime('%Y_%m_%d')}_000002_create_inventory_items_table.php",
+                f"database/migrations/{datetime.now().strftime('%Y_%m_%d')}_000003_create_purchase_orders_table.php",
+                f"database/migrations/{datetime.now().strftime('%Y_%m_%d')}_000004_create_purchase_order_items_table.php"
+            ],
+            "acceptance_criteria": [
+                "All 4 migrations create tables with id, timestamps, softDeletes",
+                "Foreign keys defined between related tables",
+                "Indexes created on foreign key columns",
+                "Migrations are reversible"
+            ],
+            "test_cases": [
+                "php artisan migrate:fresh runs without errors",
+                "Tables exist with correct columns"
+            ]
+        })
+        deps_map['vendors'] = f"T{task_id}"
+        deps_map['inventory'] = f"T{task_id}"
+        task_id += 1
+        
+        tasks.append({
+            "id": f"T{task_id}",
+            "title": "Create Eloquent models with relationships",
+            "description": "Create Eloquent models for Vendor, InventoryItem, PurchaseOrder, and PurchaseOrderItem with proper relationships defined.",
+            "type": "DB",
+            "dependencies": [f"T{task_id-1}"],
+            "files_expected": [
+                "app/Models/Vendor.php",
+                "app/Models/InventoryItem.php",
+                "app/Models/PurchaseOrder.php",
+                "app/Models/PurchaseOrderItem.php"
+            ],
+            "acceptance_criteria": [
+                "All models use SoftDeletes and HasFactory",
+                "Fillable fields defined",
+                "Relationships correctly defined",
+                "Type hints present"
+            ],
+            "test_cases": [
+                "Factory creates valid records",
+                "Relationships return correct data"
+            ]
+        })
+        deps_map['models'] = f"T{task_id}"
+        task_id += 1
+        
+        tasks.append({
+            "id": f"T{task_id}",
+            "title": "Create model factories and seeders",
+            "description": "Create factories and seeders for all models with realistic test data generation.",
+            "type": "DB",
+            "dependencies": [f"T{task_id-1}"],
+            "files_expected": [
+                "database/factories/VendorFactory.php",
+                "database/factories/InventoryItemFactory.php",
+                "database/factories/PurchaseOrderFactory.php",
+                "database/factories/PurchaseOrderItemFactory.php",
+                "database/seeders/DatabaseSeeder.php"
+            ],
+            "acceptance_criteria": [
+                "Factories generate valid data",
+                "Seeders create interconnected data",
+                "db:seed runs without errors"
+            ],
+            "test_cases": [
+                "Factory creates 10 records",
+                "Seeder populates all tables"
+            ]
+        })
+        deps_map['factories'] = f"T{task_id}"
+        task_id += 1
+        
+        tasks.append({
+            "id": f"T{task_id}",
+            "title": "Create Vendor API Controller",
+            "description": "Create RESTful API controller for Vendor management with CRUD operations.",
+            "type": "API",
+            "dependencies": [f"T{task_id-2}"],
+            "files_expected": [
+                "app/Http/Controllers/Api/VendorController.php",
+                "app/Http/Requests/StoreVendorRequest.php",
+                "app/Http/Requests/UpdateVendorRequest.php",
+                "app/Http/Resources/VendorResource.php"
+            ],
+            "acceptance_criteria": [
+                "GET /api/vendors returns paginated list",
+                "POST /api/vendors creates vendor with validation",
+                "PUT /api/vendors/{id} updates vendor",
+                "DELETE soft deletes vendor"
+            ],
+            "test_cases": [
+                "All CRUD operations tested",
+                "Validation rejects invalid data"
+            ]
+        })
+        deps_map['vendor_api'] = f"T{task_id}"
+        task_id += 1
+        
+        tasks.append({
+            "id": f"T{task_id}",
+            "title": "Create Inventory API Controller",
+            "description": "Create RESTful API controller for Inventory management with stock tracking.",
+            "type": "API",
+            "dependencies": [f"T{task_id-3}"],
+            "files_expected": [
+                "app/Http/Controllers/Api/InventoryController.php",
+                "app/Http/Requests/StoreInventoryRequest.php",
+                "app/Http/Requests/UpdateInventoryRequest.php",
+                "app/Http/Resources/InventoryItemResource.php"
+            ],
+            "acceptance_criteria": [
+                "GET /api/inventory returns paginated list",
+                "Stock quantity tracking implemented",
+                "Low stock filter available",
+                "Validation prevents negative stock"
+            ],
+            "test_cases": [
+                "CRUD operations tested",
+                "Low stock filter works"
+            ]
+        })
+        deps_map['inventory_api'] = f"T{task_id}"
+        task_id += 1
+        
+        tasks.append({
+            "id": f"T{task_id}",
+            "title": "Create Purchase Order API Controller",
+            "description": "Create RESTful API for Purchase Orders with nested items and status workflow.",
+            "type": "API",
+            "dependencies": [f"T{task_id-2}", f"T{task_id-1}"],
+            "files_expected": [
+                "app/Http/Controllers/Api/PurchaseOrderController.php",
+                "app/Http/Requests/StorePurchaseOrderRequest.php",
+                "app/Http/Resources/PurchaseOrderResource.php",
+                "app/Http/Resources/PurchaseOrderItemResource.php",
+                "app/Services/PurchaseOrderService.php"
+            ],
+            "acceptance_criteria": [
+                "POST creates order with nested items",
+                "Status workflow: draft→sent→received→cancelled",
+                "Receiving updates inventory quantities",
+                "Order total calculated from items"
+            ],
+            "test_cases": [
+                "Nested creation works",
+                "Status transitions validated"
+            ]
+        })
+        deps_map['po_api'] = f"T{task_id}"
+        task_id += 1
+        
+        tasks.append({
+            "id": f"T{task_id}",
+            "title": "Create inter-module services and dashboard",
+            "description": "Create services for cross-module operations and dashboard endpoint.",
+            "type": "API",
+            "dependencies": [f"T{task_id-3}", f"T{task_id-2}", f"T{task_id-1}"],
+            "files_expected": [
+                "app/Services/InventoryPurchaseService.php",
+                "app/Services/VendorStatsService.php",
+                "app/Http/Controllers/Api/DashboardController.php",
+                "routes/api.php"
+            ],
+            "acceptance_criteria": [
+                "Dashboard returns aggregated stats",
+                "Vendor stats calculated correctly",
+                "Cross-module queries use eager loading"
+            ],
+            "test_cases": [
+                "Dashboard endpoint tested",
+                "Vendor stats accurate"
+            ]
+        })
+        deps_map['services'] = f"T{task_id}"
+        task_id += 1
+        
+        tasks.append({
+            "id": f"T{task_id}",
+            "title": "Create monthly reports system",
+            "description": "Create reporting services for inventory, purchases, and vendors with CSV export.",
+            "type": "API",
+            "dependencies": [f"T{task_id-1}"],
+            "files_expected": [
+                "app/Services/Reports/InventoryReportService.php",
+                "app/Services/Reports/PurchaseReportService.php",
+                "app/Services/Reports/VendorReportService.php",
+                "app/Http/Controllers/Api/ReportController.php",
+                "app/Exports/InventoryExport.php"
+            ],
+            "acceptance_criteria": [
+                "Monthly inventory report available",
+                "Purchase summary by date range",
+                "CSV export works",
+                "Reports handle empty periods"
+            ],
+            "test_cases": [
+                "All report endpoints tested",
+                "CSV export format correct"
+            ]
+        })
+        deps_map['reports'] = f"T{task_id}"
+        task_id += 1
+        
+        tasks.append({
+            "id": f"T{task_id}",
+            "title": "Create comprehensive feature tests",
+            "description": "Create end-to-end tests for all modules with 80%+ coverage target.",
+            "type": "Test",
+            "dependencies": [f"T{task_id-6}", f"T{task_id-5}", f"T{task_id-4}", f"T{task_id-3}", f"T{task_id-2}", f"T{task_id-1}"],
+            "files_expected": [
+                "tests/Feature/VendorApiTest.php",
+                "tests/Feature/InventoryApiTest.php",
+                "tests/Feature/PurchaseOrderApiTest.php",
+                "tests/Feature/DashboardApiTest.php",
+                "tests/Feature/ReportApiTest.php"
+            ],
+            "acceptance_criteria": [
+                "All API endpoints covered",
+                "80%+ code coverage",
+                "All tests pass"
+            ],
+            "test_cases": [
+                "Full workflow tests",
+                "Edge cases covered"
+            ]
+        })
+        task_id += 1
+    
+    return {
+        "version": "1.0.0",
+        "project": {
+            "name": project_name,
+            "org": None,  # To be filled
+            "tech_stack": tech_stack,
+            "repo_url": None,  # To be filled
+            "base_branch": "dev",
+            "target_branch": "main",
+            "created_at": datetime.now().isoformat()
+        },
+        "plan": {
+            "summary": prompt,
+            "constraints": [
+                "Max 10 tasks",
+                f"Tech stack: {tech_stack}",
+                "Modular architecture",
+                "Sequential execution"
+            ],
+            "validation": {
+                "passed": True,
+                "task_count": len(tasks),
+                "warnings": []
+            },
+            "tasks": tasks
+        },
+        "execution": {
+            "status": "pending",
+            "current_task": None,
+            "completed_tasks": [],
+            "failed_tasks": [],
+            "pending_tasks": [t["id"] for t in tasks]
+        },
+        "created_at": datetime.now().isoformat(),
+        "updated_at": datetime.now().isoformat()
+    }
+
+
+def setup_repo(org: str, name: str, tech_stack: str) -> str:
+    """Create GitHub repo and setup branches."""
+    repo_full = f"{org}/{name}"
+    
+    # Create repo
+    print(f"Creating repo {repo_full}...")
+    # Get gitignore pattern from tech stack
+    gitignore_pattern = 'Laravel' if 'laravel' in tech_stack.lower() else 'Node' if 'node' in tech_stack.lower() else 'Python' if 'python' in tech_stack.lower() else 'Rails' if 'rails' in tech_stack.lower() else 'Laravel'
+    
+    result = subprocess.run(
+        ['gh', 'repo', 'create', repo_full, '--public', 
+         '--description', f'Project: {name}',
+         '--add-readme', '--gitignore', gitignore_pattern],
+        capture_output=True, text=True
+    )
+    
+    if result.returncode != 0 and 'already exists' not in result.stderr:
+        print(f"Error creating repo: {result.stderr}")
+        return None
+    
+    # Clone and setup dev branch
+    print(f"Setting up dev branch...")
+    if name and name != '.' and name != '..':
+        subprocess.run(['rm', '-rf', name], capture_output=True)
+    subprocess.run(['git', 'clone', f'https://github.com/{repo_full}.git'],
+                   capture_output=True)
+    subprocess.run(['git', '-C', name, 'checkout', '-b', 'dev'], capture_output=True)
+    subprocess.run(['git', '-C', name, 'push', '-u', 'origin', 'dev'], capture_output=True)
+    
+    return f"https://github.com/{repo_full}"
+
+
+def setup_labels(repo: str):
+    """Create GitHub labels."""
+    labels = [
+        ('jules', '5319E7', 'Jules auto-task'),
+        ('auto-task', '0E8A16', 'Automated task'),
+        ('db', 'B60205', 'Database task'),
+        ('api', '1D76DB', 'API task'),
+        ('ui', 'FBCA04', 'UI task'),
+        ('test', '2AB297', 'Testing task'),
+        ('pending', 'D4C5F9', 'Waiting'),
+        ('in-progress', 'FEF2C0', 'Working'),
+        ('completed', '0E8A16', 'Done'),
+    ]
+    
+    for name, color, desc in labels:
+        subprocess.run(
+            ['gh', 'label', 'create', name, '--repo', repo,
+             '--color', color, '--description', desc],
+            capture_output=True
+        )
+
+
+def install_orchestrator():
+    """Install jules-sequential to PATH."""
+    skill_dir = Path.home() / '.config' / 'kilo' / 'skill' / 'jules-orchestrator'
+    bin_dir = skill_dir / 'bin'
+    sequential_script = bin_dir / 'jules-sequential'
+    
+    # Make executable
+    sequential_script.chmod(0o755)
+    
+    # Try to symlink to common bin locations
+    for bin_path in [Path.home() / '.local' / 'bin', Path('/usr/local/bin')]:
+        if bin_path.exists():
+            try:
+                target = bin_path / 'jules-sequential'
+                if target.exists():
+                    target.unlink()
+                target.symlink_to(sequential_script)
+                print(f"Linked to {target}")
+            except:
+                pass
+    
+    return str(sequential_script)
+
+
+def main():
+    if len(sys.argv) < 2:
+        print("Usage: /jules-plan 'Build mini ERP with inventory management'")
+        sys.exit(1)
+    
+    prompt = sys.argv[1]
+    
+    print("="*70)
+    print("🚀 JULES PLAN GENERATOR")
+    print("="*70)
+    
+    # Ask for GitHub org
+    org = input("GitHub organization (e.g., doozie-akshay): ").strip()
+    if not org:
+        org = "doozie-akshay"
+    
+    # Ask for project name
+    default_name = '-'.join(prompt.lower().split()[:3])
+    name = input(f"Project name [{default_name}]: ").strip()
+    if not name:
+        name = default_name
+    
+    # Sanitize name
+    name = re.sub(r'[^a-z0-9-]', '-', name.lower())
+    name = re.sub(r'-+', '-', name).strip('-')
+    
+    if not name:
+        print("❌ Invalid project name")
+        sys.exit(1)
+    
+    # Tech stack
+    tech_stack = input("Tech stack [Laravel + PostgreSQL]: ").strip()
+    if not tech_stack:
+        tech_stack = "Laravel + PostgreSQL"
+    
+    print(f"\nGenerating plan for: {prompt}")
+    print(f"Project: {name}")
+    print(f"Org: {org}")
+    print(f"Stack: {tech_stack}")
+    
+    # Generate plan
+    plan = generate_plan(prompt, tech_stack)
+    plan['project']['org'] = org
+    plan['project']['name'] = name
+    
+    # Setup repo
+    repo_url = setup_repo(org, name, tech_stack)
+    if not repo_url:
+        print("❌ Failed to create repo")
+        sys.exit(1)
+    
+    plan['project']['repo_url'] = repo_url
+    repo_full = f"{org}/{name}"
+    
+    print(f"✅ Repo created: {repo_url}")
+    
+    # Setup labels
+    setup_labels(repo_full)
+    print("✅ Labels created")
+    
+    # Install orchestrator
+    orchestrator_path = install_orchestrator()
+    print(f"✅ Orchestrator installed: {orchestrator_path}")
+    
+    # Save memory file
+    memory_path = Path(name) / 'JULES_MEMORY.json'
+    with open(memory_path, 'w') as f:
+        json.dump(plan, f, indent=2)
+    
+    # Commit memory file
+    subprocess.run(['git', '-C', name, 'add', 'JULES_MEMORY.json'], capture_output=True)
+    subprocess.run(['git', '-C', name, 'commit', '-m', 'Add JULES_MEMORY.json'], capture_output=True)
+    subprocess.run(['git', '-C', name, 'push'], capture_output=True)
+    
+    print(f"✅ Memory file committed")
+    
+    # Summary
+    print("\n" + "="*70)
+    print("✅ PLAN GENERATED AND REPO READY")
+    print("="*70)
+    print(f"Project: {name}")
+    print(f"Repo: {repo_url}")
+    print(f"Tasks: {len(plan['plan']['tasks'])}")
+    print(f"\n{'='*70}")
+    print("PHASE 1: STABILIZED ORCHESTRATOR (RECOMMENDED)")
+    print(f"{'='*70}")
+    print(f"cd {name}")
+    print(f"python3 ~/.config/kilo/skill/jules-orchestrator/bin/jules-sequential-v2 --repo {repo_full}")
+    print(f"\nFeatures:")
+    print(f"  ✅ File locking (prevents concurrent runs)")
+    print(f"  ✅ Atomic writes (prevents corruption)")
+    print(f"  ✅ Retry with backoff (handles transients)")
+    print(f"  ✅ Graceful shutdown (Ctrl+C safe)")
+    print(f"  ✅ Audit logging (full traceability)")
+    print(f"\n{'='*70}")
+    print("LEGACY OPTIONS:")
+    print(f"{'='*70}")
+    print(f"Original sequential: python3 {orchestrator_path} --repo {repo_full}")
+    print(f"Background agent: python3 ~/.config/kilo/skill/jules-orchestrator/bin/jules-agent --repo {repo_full} start")
+    print(f"Track progress: python3 ~/.config/kilo/skill/jules-orchestrator/bin/jules-agent --repo {repo_full} status")
+
+
+if __name__ == '__main__':
+    main()

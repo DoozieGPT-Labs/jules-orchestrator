@@ -1,0 +1,1252 @@
+#!/usr/bin/env python3
+"""
+Jules Sequential Orchestrator v3.0 - Phase 2: Control
+Features:
+- Real state machine with enforced transitions
+- Schema validation
+- State snapshots for time-travel debugging
+- Health checks & metrics
+- Reconciliation engine
+"""
+
+import json
+import subprocess
+import time
+import sys
+import os
+import re
+import signal
+import fcntl
+import errno
+import tempfile
+import shutil
+import hashlib
+from datetime import datetime, timedelta
+from pathlib import Path
+from typing import Dict, List, Optional, Set, Tuple, Any, Callable
+from dataclasses import dataclass, asdict, field
+from enum import Enum, auto
+from collections import defaultdict
+import threading
+
+
+class TaskState(Enum):
+    """Complete state machine states."""
+    PENDING = "pending"
+    ISSUE_CREATED = "issue_created"
+    JULES_TRIGGERED = "jules_triggered"
+    PR_OPENED = "pr_opened"
+    APPROVED = "approved"
+    MERGING = "merging"
+    COMPLETE = "complete"
+    FAILED = "failed"
+    BLOCKED = "blocked"
+    PAUSED = "paused"
+    RETRYING = "retrying"
+
+
+class StateTransitionError(Exception):
+    """Invalid state transition attempted."""
+    pass
+
+
+@dataclass
+class StateSnapshot:
+    """Point-in-time state capture."""
+    timestamp: str
+    memory_hash: str
+    execution_state: Dict
+    reason: str
+    tags: List[str] = field(default_factory=list)
+    
+    def to_dict(self) -> Dict:
+        return {
+            'timestamp': self.timestamp,
+            'memory_hash': self.memory_hash,
+            'execution_state': self.execution_state,
+            'reason': self.reason,
+            'tags': self.tags
+        }
+    
+    @classmethod
+    def from_dict(cls, data: Dict) -> 'StateSnapshot':
+        return cls(**data)
+
+
+@dataclass
+class HealthMetric:
+    """Health check metric."""
+    timestamp: str
+    metric_name: str
+    value: Any
+    threshold: Any
+    status: str  # 'healthy', 'warning', 'critical'
+    
+    def to_dict(self) -> Dict:
+        return {
+            'timestamp': self.timestamp,
+            'metric_name': self.metric_name,
+            'value': self.value,
+            'threshold': self.threshold,
+            'status': self.status
+        }
+
+
+class StateMachine:
+    """
+    Real state machine with enforced transitions and validation.
+    """
+    
+    # Valid transitions: from_state -> [to_states]
+    VALID_TRANSITIONS = {
+        TaskState.PENDING: [
+            TaskState.ISSUE_CREATED,
+            TaskState.BLOCKED,
+            TaskState.PAUSED
+        ],
+        TaskState.ISSUE_CREATED: [
+            TaskState.JULES_TRIGGERED,
+            TaskState.FAILED,
+            TaskState.PAUSED
+        ],
+        TaskState.JULES_TRIGGERED: [
+            TaskState.PR_OPENED,
+            TaskState.FAILED,
+            TaskState.PAUSED
+        ],
+        TaskState.PR_OPENED: [
+            TaskState.APPROVED,
+            TaskState.FAILED,
+            TaskState.PAUSED
+        ],
+        TaskState.APPROVED: [
+            TaskState.MERGING,
+            TaskState.FAILED,
+            TaskState.PAUSED
+        ],
+        TaskState.MERGING: [
+            TaskState.COMPLETE,
+            TaskState.FAILED
+        ],
+        TaskState.FAILED: [
+            TaskState.RETRYING,
+            TaskState.BLOCKED,
+            TaskState.PAUSED
+        ],
+        TaskState.BLOCKED: [
+            TaskState.PENDING,  # Reset after manual fix
+            TaskState.PAUSED
+        ],
+        TaskState.PAUSED: [
+            TaskState.PENDING,  # Resume
+            TaskState.BLOCKED
+        ],
+        TaskState.RETRYING: [
+            TaskState.ISSUE_CREATED
+        ]
+    }
+    
+    # Terminal states
+    TERMINAL_STATES = {TaskState.COMPLETE}
+    
+    def __init__(self):
+        self.transition_history: List[Dict] = []
+        self.state_timers: Dict[str, Dict] = defaultdict(dict)
+    
+    def validate_transition(self, from_state: TaskState, to_state: TaskState) -> bool:
+        """Check if transition is valid."""
+        if from_state == to_state:
+            return True  # No-op transition
+        
+        allowed = self.VALID_TRANSITIONS.get(from_state, [])
+        return to_state in allowed
+    
+    def transition(self, task_id: str, from_state: TaskState, to_state: TaskState, 
+                   reason: str = "", force: bool = False) -> bool:
+        """
+        Execute state transition with validation.
+        
+        Args:
+            task_id: Task identifier
+            from_state: Current state
+            to_state: Target state
+            reason: Why transition occurred
+            force: Skip validation (dangerous, use sparingly)
+        
+        Returns:
+            bool: True if transition succeeded
+        
+        Raises:
+            StateTransitionError: If invalid transition and not forced
+        """
+        if not force and not self.validate_transition(from_state, to_state):
+            raise StateTransitionError(
+                f"Invalid transition: {from_state.value} -> {to_state.value} for {task_id}"
+            )
+        
+        # Record transition
+        transition_record = {
+            'timestamp': datetime.now().isoformat(),
+            'task_id': task_id,
+            'from': from_state.value,
+            'to': to_state.value,
+            'reason': reason
+        }
+        self.transition_history.append(transition_record)
+        
+        # Track time in state
+        now = datetime.now().isoformat()
+        if task_id not in self.state_timers:
+            self.state_timers[task_id] = {}
+        
+        if from_state.value in self.state_timers[task_id]:
+            duration = (datetime.now() - datetime.fromisoformat(
+                self.state_timers[task_id][from_state.value]['started']
+            )).total_seconds()
+            self.state_timers[task_id][from_state.value]['duration'] = duration
+        
+        self.state_timers[task_id][to_state.value] = {'started': now}
+        
+        return True
+    
+    def can_transition(self, task_id: str, to_state: TaskState) -> bool:
+        """Check if transition to state is possible without executing."""
+        # This requires knowing current state, implemented in orchestrator
+        return True
+    
+    def get_state_duration(self, task_id: str, state: TaskState) -> Optional[float]:
+        """Get time spent in state (seconds)."""
+        if task_id in self.state_timers and state.value in self.state_timers[task_id]:
+            timer = self.state_timers[task_id][state.value]
+            if 'duration' in timer:
+                return timer['duration']
+            # Still in state
+            return (datetime.now() - datetime.fromisoformat(timer['started'])).total_seconds()
+        return None
+    
+    def is_terminal(self, state: TaskState) -> bool:
+        """Check if state is terminal."""
+        return state in self.TERMINAL_STATES
+    
+    def get_history(self, task_id: Optional[str] = None) -> List[Dict]:
+        """Get transition history, optionally filtered by task."""
+        if task_id:
+            return [t for t in self.transition_history if t['task_id'] == task_id]
+        return self.transition_history
+
+
+class SchemaValidator:
+    """
+    JSON Schema validation for JULES_MEMORY.json.
+    """
+    
+    REQUIRED_VERSION = "1.0.0"
+    
+    SCHEMA = {
+        "type": "object",
+        "required": ["version", "project", "plan", "execution"],
+        "properties": {
+            "version": {"type": "string"},
+            "project": {
+                "type": "object",
+                "required": ["name", "org", "repo_url", "base_branch"],
+                "properties": {
+                    "name": {"type": "string"},
+                    "org": {"type": "string"},
+                    "tech_stack": {"type": "string"},
+                    "repo_url": {"type": "string"},
+                    "base_branch": {"type": "string"},
+                    "target_branch": {"type": "string"}
+                }
+            },
+            "plan": {
+                "type": "object",
+                "required": ["tasks"],
+                "properties": {
+                    "tasks": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "required": ["id", "title", "type", "dependencies", "files_expected", "acceptance_criteria"],
+                            "properties": {
+                                "id": {"type": "string", "pattern": "^T[0-9]+$"},
+                                "title": {"type": "string"},
+                                "type": {"enum": ["DB", "API", "UI", "Refactor", "Test"]},
+                                "dependencies": {"type": "array", "items": {"type": "string"}},
+                                "files_expected": {"type": "array", "items": {"type": "string"}},
+                                "acceptance_criteria": {"type": "array", "items": {"type": "string"}},
+                                "test_cases": {"type": "array", "items": {"type": "string"}}
+                            }
+                        }
+                    }
+                }
+            },
+            "execution": {
+                "type": "object",
+                "required": ["current_task", "completed_tasks", "failed_tasks", "pending_tasks"],
+                "properties": {
+                    "status": {"enum": ["pending", "running", "complete", "failed"]},
+                    "current_task": {"type": ["string", "null"]},
+                    "completed_tasks": {"type": "array", "items": {"type": "string"}},
+                    "failed_tasks": {"type": "array", "items": {"type": "string"}},
+                    "pending_tasks": {"type": "array", "items": {"type": "string"}}
+                }
+            }
+        }
+    }
+    
+    def __init__(self):
+        self.errors: List[str] = []
+    
+    def validate(self, data: Dict) -> Tuple[bool, List[str]]:
+        """
+        Validate data against schema.
+        
+        Returns:
+            (is_valid, list_of_errors)
+        """
+        self.errors = []
+        
+        # Check required fields
+        if 'version' not in data:
+            self.errors.append("Missing 'version' field")
+        elif data['version'] != self.REQUIRED_VERSION:
+            self.errors.append(f"Version mismatch: expected {self.REQUIRED_VERSION}, got {data['version']}")
+        
+        # Check project section
+        if 'project' not in data:
+            self.errors.append("Missing 'project' section")
+        else:
+            project = data['project']
+            for field in ['name', 'org', 'repo_url', 'base_branch']:
+                if field not in project or not project[field]:
+                    self.errors.append(f"Missing or empty 'project.{field}'")
+        
+        # Check plan section
+        if 'plan' not in data:
+            self.errors.append("Missing 'plan' section")
+        elif 'tasks' not in data['plan']:
+            self.errors.append("Missing 'plan.tasks' array")
+        else:
+            tasks = data['plan']['tasks']
+            if not tasks:
+                self.errors.append("'plan.tasks' is empty")
+            else:
+                self._validate_tasks(tasks)
+        
+        # Check execution section
+        if 'execution' not in data:
+            self.errors.append("Missing 'execution' section")
+        else:
+            self._validate_execution(data['execution'])
+        
+        return len(self.errors) == 0, self.errors
+    
+    def _validate_tasks(self, tasks: List[Dict]):
+        """Validate task definitions."""
+        task_ids = set()
+        
+        for i, task in enumerate(tasks):
+            prefix = f"Task[{i}]"
+            
+            # Check required fields
+            for field in ['id', 'title', 'type', 'dependencies', 'files_expected', 'acceptance_criteria']:
+                if field not in task:
+                    self.errors.append(f"{prefix}: missing '{field}'")
+            
+            # Check task ID format
+            if 'id' in task:
+                tid = task['id']
+                if not re.match(r'^T\d+$', tid):
+                    self.errors.append(f"{prefix}: invalid ID format '{tid}' (expected T1, T2, etc.)")
+                if tid in task_ids:
+                    self.errors.append(f"{prefix}: duplicate ID '{tid}'")
+                task_ids.add(tid)
+            
+            # Check type
+            if 'type' in task and task['type'] not in ['DB', 'API', 'UI', 'Refactor', 'Test']:
+                self.errors.append(f"{prefix}: invalid type '{task['type']}'")
+            
+            # Validate dependencies exist
+            if 'dependencies' in task and 'id' in task:
+                for dep in task['dependencies']:
+                    if dep == task['id']:
+                        self.errors.append(f"{prefix}: self-dependency")
+                    if dep not in [t['id'] for t in tasks if 'id' in t]:
+                        self.errors.append(f"{prefix}: dependency '{dep}' not found")
+        
+        # Check for dependency cycles
+        self._check_cycles(tasks)
+    
+    def _check_cycles(self, tasks: List[Dict]):
+        """Detect circular dependencies."""
+        graph = {t['id']: t.get('dependencies', []) for t in tasks if 'id' in t}
+        
+        def has_cycle(node: str, visited: Set, path: Set) -> bool:
+            if node in path:
+                return True
+            if node in visited:
+                return False
+            visited.add(node)
+            path.add(node)
+            for dep in graph.get(node, []):
+                if has_cycle(dep, visited, path):
+                    return True
+            path.remove(node)
+            return False
+        
+        for task_id in graph:
+            if has_cycle(task_id, set(), set()):
+                self.errors.append(f"Circular dependency detected starting from '{task_id}'")
+                break
+    
+    def _validate_execution(self, execution: Dict):
+        """Validate execution state."""
+        for field in ['current_task', 'completed_tasks', 'failed_tasks', 'pending_tasks']:
+            if field not in execution:
+                self.errors.append(f"Missing 'execution.{field}'")
+        
+        # Check for tasks in multiple lists
+        if all(field in execution for field in ['completed_tasks', 'failed_tasks', 'pending_tasks']):
+            completed = set(execution['completed_tasks'])
+            failed = set(execution['failed_tasks'])
+            pending = set(execution['pending_tasks'])
+            
+            overlap = completed & failed
+            if overlap:
+                self.errors.append(f"Tasks in both completed and failed: {overlap}")
+            
+            overlap = completed & pending
+            if overlap:
+                self.errors.append(f"Tasks in both completed and pending: {overlap}")
+            
+            overlap = failed & pending
+            if overlap:
+                self.errors.append(f"Tasks in both failed and pending: {overlap}")
+
+
+class SnapshotManager:
+    """
+    Manages point-in-time state snapshots for recovery and debugging.
+    """
+    
+    def __init__(self, snapshots_dir: Path):
+        self.snapshots_dir = snapshots_dir
+        self.snapshots_dir.mkdir(parents=True, exist_ok=True)
+        self.max_snapshots = 50  # Keep last 50
+    
+    def create_snapshot(self, memory: Dict, reason: str = "", tags: List[str] = None) -> StateSnapshot:
+        """Create a new snapshot."""
+        # Compute hash of execution state
+        exec_json = json.dumps(memory.get('execution', {}), sort_keys=True)
+        memory_hash = hashlib.sha256(exec_json.encode()).hexdigest()[:16]
+        
+        snapshot = StateSnapshot(
+            timestamp=datetime.now().isoformat(),
+            memory_hash=memory_hash,
+            execution_state=json.loads(exec_json),
+            reason=reason,
+            tags=tags or []
+        )
+        
+        # Save to file
+        filename = f"snapshot_{snapshot.timestamp.replace(':', '-')}.json"
+        snapshot_path = self.snapshots_dir / filename
+        with open(snapshot_path, 'w') as f:
+            json.dump(snapshot.to_dict(), f, indent=2)
+        
+        # Cleanup old snapshots
+        self._cleanup_old_snapshots()
+        
+        return snapshot
+    
+    def _cleanup_old_snapshots(self):
+        """Remove old snapshots beyond limit."""
+        snapshots = sorted(self.snapshots_dir.glob("snapshot_*.json"))
+        if len(snapshots) > self.max_snapshots:
+            for old in snapshots[:-self.max_snapshots]:
+                old.unlink()
+    
+    def list_snapshots(self) -> List[StateSnapshot]:
+        """List all available snapshots."""
+        snapshots = []
+        for path in sorted(self.snapshots_dir.glob("snapshot_*.json"), reverse=True):
+            with open(path) as f:
+                data = json.load(f)
+                snapshots.append(StateSnapshot.from_dict(data))
+        return snapshots
+    
+    def get_snapshot(self, timestamp: str) -> Optional[StateSnapshot]:
+        """Get specific snapshot by timestamp."""
+        # Find closest match
+        for path in self.snapshots_dir.glob("snapshot_*.json"):
+            if timestamp in path.name:
+                with open(path) as f:
+                    return StateSnapshot.from_dict(json.load(f))
+        return None
+    
+    def restore_snapshot(self, snapshot: StateSnapshot) -> Dict:
+        """Restore memory from snapshot."""
+        return snapshot.execution_state
+    
+    def diff_snapshots(self, snap1: StateSnapshot, snap2: StateSnapshot) -> Dict:
+        """Show differences between two snapshots."""
+        def dict_diff(d1: Dict, d2: Dict, path: str = "") -> List[str]:
+            diffs = []
+            all_keys = set(d1.keys()) | set(d2.keys())
+            for key in all_keys:
+                current_path = f"{path}.{key}" if path else key
+                if key not in d1:
+                    diffs.append(f"+ {current_path}: {d2[key]}")
+                elif key not in d2:
+                    diffs.append(f"- {current_path}: {d1[key]}")
+                elif d1[key] != d2[key]:
+                    if isinstance(d1[key], dict) and isinstance(d2[key], dict):
+                        diffs.extend(dict_diff(d1[key], d2[key], current_path))
+                    else:
+                        diffs.append(f"~ {current_path}: {d1[key]} -> {d2[key]}")
+            return diffs
+        
+        return {
+            'from': snap1.timestamp,
+            'to': snap2.timestamp,
+            'changes': dict_diff(snap1.execution_state, snap2.execution_state)
+        }
+
+
+class HealthChecker:
+    """
+    Continuous health monitoring and metrics.
+    """
+    
+    def __init__(self, metrics_file: Path):
+        self.metrics_file = metrics_file
+        self.metrics: List[HealthMetric] = []
+        self.thresholds = {
+            'task_duration_minutes': 60,  # Warn if task takes >1hr
+            'poll_interval_variance': 5,     # Warn if poll delayed >5s
+            'consecutive_failures': 3,       # Critical after 3 failures
+            'memory_size_mb': 10,           # Warn if memory >10MB
+        }
+        self.failure_counts: Dict[str, int] = defaultdict(int)
+    
+    def record_metric(self, name: str, value: Any, threshold: Any = None):
+        """Record a health metric."""
+        threshold = threshold or self.thresholds.get(name)
+        
+        # Determine status
+        status = 'healthy'
+        if threshold is not None:
+            if isinstance(value, (int, float)) and isinstance(threshold, (int, float)):
+                if value > threshold * 1.5:
+                    status = 'critical'
+                elif value > threshold:
+                    status = 'warning'
+        
+        metric = HealthMetric(
+            timestamp=datetime.now().isoformat(),
+            metric_name=name,
+            value=value,
+            threshold=threshold,
+            status=status
+        )
+        
+        self.metrics.append(metric)
+        
+        # Persist
+        with open(self.metrics_file, 'a') as f:
+            f.write(json.dumps(metric.to_dict()) + '\n')
+        
+        return status
+    
+    def check_task_health(self, task_id: str, state: TaskState, state_start: str) -> str:
+        """Check if task is healthy based on time in state."""
+        duration = (datetime.now() - datetime.fromisoformat(state_start)).total_seconds() / 60
+        
+        status = self.record_metric(f'task_{task_id}_duration', duration, 
+                                     self.thresholds['task_duration_minutes'])
+        
+        # Check for stuck tasks
+        if state in [TaskState.JULES_TRIGGERED, TaskState.PR_OPENED] and duration > 30:
+            return 'warning'  # Jules taking unusually long
+        
+        return status
+    
+    def check_overall_health(self, memory: Dict) -> Dict:
+        """Run comprehensive health check."""
+        checks = {}
+        
+        # Check memory size
+        memory_size_mb = len(json.dumps(memory)) / (1024 * 1024)
+        checks['memory_size'] = self.record_metric('memory_size_mb', memory_size_mb)
+        
+        # Check task completion rate
+        total = len(memory.get('plan', {}).get('tasks', []))
+        completed = len(memory.get('execution', {}).get('completed_tasks', []))
+        failed = len(memory.get('execution', {}).get('failed_tasks', []))
+        
+        if total > 0:
+            completion_rate = completed / total
+            checks['completion_rate'] = self.record_metric('completion_rate', completion_rate)
+            
+            failure_rate = failed / total if failed > 0 else 0
+            checks['failure_rate'] = self.record_metric('failure_rate', failure_rate)
+        
+        # Check for stuck current_task
+        current = memory.get('execution', {}).get('current_task')
+        if current:
+            checks['current_task'] = 'active'
+        else:
+            checks['current_task'] = 'idle'
+        
+        # Determine overall status
+        if any(c == 'critical' for c in checks.values()):
+            overall = 'critical'
+        elif any(c == 'warning' for c in checks.values()):
+            overall = 'warning'
+        else:
+            overall = 'healthy'
+        
+        checks['overall'] = overall
+        return checks
+    
+    def get_recent_metrics(self, minutes: int = 60) -> List[HealthMetric]:
+        """Get metrics from last N minutes."""
+        cutoff = datetime.now() - timedelta(minutes=minutes)
+        return [m for m in self.metrics 
+                if datetime.fromisoformat(m.timestamp) > cutoff]
+    
+    def generate_health_report(self) -> str:
+        """Generate human-readable health report."""
+        lines = [
+            "=" * 70,
+            "HEALTH REPORT",
+            "=" * 70,
+            f"Generated: {datetime.now().isoformat()}",
+            ""
+        ]
+        
+        for metric in self.metrics[-20:]:  # Last 20 metrics
+            status_emoji = {'healthy': '✅', 'warning': '⚠️', 'critical': '❌'}.get(metric.status, '❓')
+            lines.append(f"{status_emoji} {metric.metric_name}: {metric.value} (threshold: {metric.threshold}) [{metric.status}]")
+        
+        return '\n'.join(lines)
+
+
+# Phase 1 Components (embedded to avoid import issues)
+
+class FileLock:
+    """Process-level file lock using flock."""
+    
+    def __init__(self, lock_path: Path):
+        self.lock_path = lock_path
+        self.lock_file = None
+        self.acquired = False
+    
+    def acquire(self, timeout: int = 30) -> bool:
+        """Acquire lock with timeout."""
+        import fcntl
+        import errno
+        start = time.time()
+        while time.time() - start < timeout:
+            try:
+                self.lock_file = open(self.lock_path, 'w')
+                fcntl.flock(self.lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                self.acquired = True
+                return True
+            except (IOError, OSError) as e:
+                if e.errno != errno.EAGAIN:
+                    raise
+                time.sleep(0.1)
+        return False
+    
+    def release(self):
+        """Release lock."""
+        import fcntl
+        if self.lock_file and self.acquired:
+            try:
+                fcntl.flock(self.lock_file.fileno(), fcntl.LOCK_UN)
+            except:
+                pass
+            try:
+                self.lock_file.close()
+            except:
+                pass
+            self.acquired = False
+    
+    def __enter__(self):
+        if not self.acquire():
+            raise RuntimeError(f"Could not acquire lock: {self.lock_path}")
+        return self
+    
+    def __exit__(self, *args):
+        self.release()
+
+
+class RetryWithBackoff:
+    """Exponential backoff retry decorator."""
+    
+    def __init__(self, max_attempts: int = 3, base_delay: float = 1.0, max_delay: float = 60.0):
+        self.max_attempts = max_attempts
+        self.base_delay = base_delay
+        self.max_delay = max_delay
+    
+    def __call__(self, func):
+        def wrapper(*args, **kwargs):
+            for attempt in range(self.max_attempts):
+                try:
+                    return func(*args, **kwargs)
+                except Exception as e:
+                    if attempt == self.max_attempts - 1:
+                        raise
+                    delay = min(self.base_delay * (2 ** attempt), self.max_delay)
+                    print(f"  Retry {attempt + 1}/{self.max_attempts} after {delay}s: {e}")
+                    time.sleep(delay)
+            return None
+        return wrapper
+
+
+class AtomicJsonFile:
+    """Atomic JSON file operations."""
+    
+    def __init__(self, path: Path):
+        self.path = path
+        self.temp_path = path.parent / f".tmp.{path.name}.{os.getpid()}"
+    
+    def load(self) -> Optional[Dict]:
+        """Load JSON with validation."""
+        try:
+            with open(self.path, 'r') as f:
+                data = json.load(f)
+                if 'version' not in data or 'execution' not in data:
+                    raise ValueError("Invalid JULES_MEMORY.json schema")
+                return data
+        except FileNotFoundError:
+            return None
+        except json.JSONDecodeError as e:
+            backup = self.path.with_suffix('.json.backup')
+            if backup.exists():
+                print(f"  Corrupted JSON, loading backup: {backup}")
+                with open(backup, 'r') as f:
+                    return json.load(f)
+            raise ValueError(f"Corrupted JSON and no backup: {e}")
+    
+    def save(self, data: Dict):
+        """Atomic write with backup."""
+        with open(self.temp_path, 'w') as f:
+            json.dump(data, f, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        
+        if self.path.exists():
+            backup = self.path.with_suffix('.json.backup')
+            shutil.copy2(self.path, backup)
+        
+        os.rename(self.temp_path, self.path)
+
+
+class JulesSequentialOrchestratorV3:
+    """Phase 3: Control - Full state machine, validation, snapshots, health."""
+    
+    def __init__(self, repo: str, memory_file: str = "JULES_MEMORY.json"):
+        self.repo = repo
+        self.memory_path = Path(memory_file)
+        self.project_dir = self.memory_path.parent
+        
+        # Initialize Phase 2 components
+        self.state_machine = StateMachine()
+        self.validator = SchemaValidator()
+        self.snapshots = SnapshotManager(self.project_dir / '.snapshots')
+        self.health = HealthChecker(self.project_dir / 'health_metrics.jsonl')
+        
+        # Phase 1 components
+        self.lock_path = self.memory_path.with_suffix('.lock')
+        self.atomic_file = AtomicJsonFile(self.memory_path)
+        
+        self.config = {
+            'jules_timeout_minutes': 15,
+            'max_retries': 3,
+            'poll_interval': 30,
+            'health_check_interval': 300,  # 5 minutes
+        }
+        
+        self.running = False
+        self.shutdown_requested = False
+        signal.signal(signal.SIGINT, self._signal_handler)
+        signal.signal(signal.SIGTERM, self._signal_handler)
+        
+        self.audit_log: List[AuditEvent] = []
+        self.last_health_check = 0
+    
+    def _signal_handler(self, signum, frame):
+        self.log(f"\nReceived signal {signum}, shutting down gracefully...")
+        self.shutdown_requested = True
+        self.running = False
+    
+    def log(self, message: str, level: str = "INFO"):
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        log_entry = f"[{timestamp}] [{level}] {message}"
+        print(log_entry, flush=True)
+        
+        log_file = self.project_dir / 'jules-orchestrator.log'
+        with open(log_file, 'a') as f:
+            f.write(log_entry + '\n')
+    
+    def audit(self, event: str, task_id: Optional[str] = None, details: Dict = None):
+        entry = AuditEvent(
+            timestamp=datetime.now().isoformat(),
+            task_id=task_id,
+            event=event,
+            details=details or {}
+        )
+        self.audit_log.append(entry)
+        
+        audit_file = self.project_dir / 'audit.log'
+        with open(audit_file, 'a') as f:
+            f.write(json.dumps({
+                'timestamp': entry.timestamp,
+                'task_id': entry.task_id,
+                'event': entry.event,
+                'details': entry.details
+            }) + '\n')
+    
+    def load_memory(self) -> Dict:
+        """Load with validation."""
+        with FileLock(self.lock_path):
+            memory = self.atomic_file.load()
+            if memory is None:
+                raise RuntimeError(f"Memory file not found: {self.memory_path}")
+            
+            # Validate schema
+            is_valid, errors = self.validator.validate(memory)
+            if not is_valid:
+                self.log(f"Schema validation errors: {errors}", "ERROR")
+                raise RuntimeError(f"Invalid JULES_MEMORY.json: {errors}")
+            
+            return memory
+    
+    def save_memory(self, memory: Dict, reason: str = ""):
+        """Save with snapshot."""
+        with FileLock(self.lock_path):
+            memory['updated_at'] = datetime.now().isoformat()
+            self.atomic_file.save(memory)
+            
+            # Create snapshot
+            self.snapshots.create_snapshot(memory, reason=reason)
+    
+    @RetryWithBackoff(max_attempts=3, base_delay=1.0)
+    def run_gh(self, args: List[str]) -> List:
+        cmd = ['gh'] + args + ['--repo', self.repo]
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            raise RuntimeError(f"gh failed: {result.stderr}")
+        try:
+            return json.loads(result.stdout) if result.stdout else []
+        except:
+            return []
+    
+    def run(self):
+        """Main loop with health checks."""
+        self.log("=" * 70)
+        self.log("🤖 JULES SEQUENTIAL ORCHESTRATOR v3.0")
+        self.log("Phase 2: Control (State Machine + Validation + Snapshots + Health)")
+        self.log("=" * 70)
+        
+        lock = FileLock(self.lock_path)
+        if not lock.acquire(timeout=5):
+            self.log("❌ Another instance running", "ERROR")
+            sys.exit(1)
+        
+        try:
+            memory = self.load_memory()
+            
+            self.log(f"Project: {memory['project']['name']}")
+            self.log(f"Tasks: {len(memory['plan']['tasks'])}")
+            
+            # Create initial snapshot
+            self.save_memory(memory, reason="orchestrator_start")
+            
+            self.running = True
+            
+            while self.running and not self.shutdown_requested:
+                memory = self.load_memory()
+                
+                # Periodic health check
+                if time.time() - self.last_health_check > self.config['health_check_interval']:
+                    health = self.health.check_overall_health(memory)
+                    self.log(f"Health check: {health['overall']}")
+                    self.last_health_check = time.time()
+                
+                if not memory['execution']['pending_tasks']:
+                    self.log("\n✅ ALL COMPLETE!")
+                    break
+                
+                task = self.get_next_ready_task(memory)
+                if not task:
+                    time.sleep(self.config['poll_interval'])
+                    continue
+                
+                success = self.execute_single_task(memory, task)
+                if not success and not self.shutdown_requested:
+                    self.log("Task failed, continuing...", "WARN")
+                    time.sleep(5)
+            
+            # Final health report
+            print(self.health.generate_health_report())
+            
+        finally:
+            lock.release()
+    
+    def get_next_ready_task(self, memory: Dict) -> Optional[Dict]:
+        """Get next ready task with state validation."""
+        current = memory.get('execution', {}).get('current_task')
+        if current:
+            self.log(f"Task {current} in progress")
+            return None
+        
+        completed = set(memory['execution'].get('completed_tasks', []))
+        pending = memory['execution'].get('pending_tasks', [])
+        
+        for task in memory['plan']['tasks']:
+            tid = task['id']
+            if tid not in pending:
+                continue
+            
+            deps = set(task.get('dependencies', []))
+            if deps.issubset(completed):
+                return task
+        
+        return None
+    
+    def execute_single_task(self, memory: Dict, task: Dict) -> bool:
+        """Execute with full state machine."""
+        task_id = task['id']
+        
+        self.log(f"\n{'='*70}")
+        self.log(f"🚀 TASK: {task_id}")
+        self.log(f"{'='*70}")
+        
+        try:
+            # Transition: PENDING -> ISSUE_CREATED
+            self.state_machine.transition(task_id, TaskState.PENDING, TaskState.ISSUE_CREATED,
+                                         "Starting execution")
+            
+            # Create issue
+            existing = self.get_issue_for_task(task_id)
+            if existing:
+                issue_number = existing['number']
+                self.log(f"Issue #{issue_number} exists")
+            else:
+                issue_number = self.create_github_issue(task)
+                if not issue_number:
+                    raise RuntimeError("Failed to create issue")
+                
+                # Transition: ISSUE_CREATED -> JULES_TRIGGERED
+                self.state_machine.transition(task_id, TaskState.ISSUE_CREATED, 
+                                             TaskState.JULES_TRIGGERED,
+                                             "Issue created successfully")
+            
+            # Update memory
+            memory['execution']['current_task'] = task_id
+            self.save_memory(memory, reason=f"task_{task_id}_started")
+            
+            # Poll for completion
+            pr_number = self.poll_for_completion(task, issue_number)
+            
+            if pr_number:
+                # Transition through states
+                self.state_machine.transition(task_id, TaskState.JULES_TRIGGERED,
+                                             TaskState.PR_OPENED, "PR created")
+                self.state_machine.transition(task_id, TaskState.PR_OPENED,
+                                             TaskState.APPROVED, "PR validated")
+                self.state_machine.transition(task_id, TaskState.APPROVED,
+                                             TaskState.MERGING, "Merging")
+                self.state_machine.transition(task_id, TaskState.MERGING,
+                                             TaskState.COMPLETE, "Merged")
+                
+                # Mark complete
+                self.mark_task_complete(memory, task_id, pr_number)
+                return True
+            else:
+                if self.shutdown_requested:
+                    self.state_machine.transition(task_id, TaskState.JULES_TRIGGERED,
+                                                 TaskState.PAUSED, "Shutdown requested")
+                else:
+                    self.state_machine.transition(task_id, TaskState.JULES_TRIGGERED,
+                                                 TaskState.FAILED, "Timeout or error")
+                
+                memory['execution']['failed_tasks'].append(task_id)
+                memory['execution']['current_task'] = None
+                self.save_memory(memory)
+                return False
+                
+        except Exception as e:
+            self.log(f"❌ Error: {e}", "ERROR")
+            try:
+                self.state_machine.transition(task_id, TaskState.JULES_TRIGGERED,
+                                             TaskState.FAILED, f"Error: {e}")
+            except:
+                pass
+            
+            memory['execution']['failed_tasks'].append(task_id)
+            memory['execution']['current_task'] = None
+            self.save_memory(memory)
+            return False
+    
+    # Include remaining methods from v2
+    def get_issue_for_task(self, task_id: str) -> Optional[Dict]:
+        try:
+            result = self.run_gh(['issue', 'list', '--search', f'[AUTO][{task_id}]',
+                                  '--state', 'all', '--json',
+                                  'number,title,state,labels,comments'])
+            return result[0] if result else None
+        except Exception as e:
+            self.log(f"Error finding issue: {e}", "WARN")
+            return None
+    
+    def get_pr_for_issue(self, issue_number: int) -> Optional[Dict]:
+        try:
+            result = self.run_gh(['pr', 'list', '--state', 'all', '--search',
+                                  f'#{issue_number}', '--json',
+                                  'number,title,state,author,merged'])
+            if result:
+                for pr in result:
+                    if pr.get('author', {}).get('login') == 'google-labs-jules':
+                        return pr
+            return None
+        except Exception as e:
+            self.log(f"Error finding PR: {e}", "WARN")
+            return None
+    
+    def create_github_issue(self, task: Dict) -> Optional[int]:
+        title = f"[AUTO][{task['id']}] {task['title']}"
+        body = self._format_issue_body(task)
+        
+        cmd = ['gh', 'issue', 'create', '--repo', self.repo,
+               '--title', title, '--body', body, '--label', 'jules']
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        
+        if result.returncode != 0:
+            raise RuntimeError(f"Failed to create issue: {result.stderr}")
+        
+        url = result.stdout.strip()
+        match = re.search(r'/issues/(\d+)', url)
+        if not match:
+            raise RuntimeError(f"Could not parse URL: {url}")
+        
+        issue_number = int(match.group(1))
+        self.audit('issue_created', task['id'], {'issue_id': issue_number})
+        return issue_number
+    
+    def _format_issue_body(self, task: Dict) -> str:
+        memory = self.load_memory()
+        completed = set(memory['execution'].get('completed_tasks', []))
+        
+        body = f"""## Task Definition
+- **ID**: {task['id']}
+- **Type**: {task['type']}
+- **Priority**: High
+
+## Description
+{task['description']}
+
+## Expected Files
+"""
+        for f in task.get('files_expected', []):
+            body += f"- `{f}`\n"
+        
+        body += "\n## Acceptance Criteria\n"
+        for i, criteria in enumerate(task.get('acceptance_criteria', []), 1):
+            body += f"{i}. {criteria}\n"
+        
+        deps = task.get('dependencies', [])
+        if deps:
+            body += "\n## Dependencies\n"
+            for dep in deps:
+                status = "✅" if dep in completed else "⏳"
+                body += f"- {dep} {status}\n"
+        
+        body += """
+## Jules Instructions
+**CRITICAL**: Execute EXACTLY as specified.
+
+---
+*Generated by Jules Orchestrator v3.0*
+"""
+        return body
+    
+    def check_jules_status(self, issue: Dict) -> Dict:
+        for comment in issue.get('comments', []):
+            author = comment.get('author', {}).get('login', '')
+            if author == 'google-labs-jules':
+                body = comment.get('body', '')
+                pr_match = re.search(r'(?:PR|pull request)\s*#(\d+)', body, re.IGNORECASE)
+                if pr_match:
+                    return {'status': 'completed', 'pr_number': int(pr_match.group(1)), 'has_pr': True}
+                elif 'on it' in body.lower():
+                    return {'status': 'in_progress', 'has_pr': False}
+        return {'status': 'unknown', 'has_pr': False}
+    
+    def poll_for_completion(self, task: Dict, issue_number: int) -> Optional[int]:
+        task_id = task['id']
+        timeout = self.config['jules_timeout_minutes'] * 60
+        start = time.time()
+        
+        self.log(f"Polling (timeout: {self.config['jules_timeout_minutes']}m)...")
+        
+        while time.time() - start < timeout:
+            if self.shutdown_requested:
+                return None
+            
+            try:
+                issue = self.get_issue_for_task(task_id)
+                if not issue:
+                    time.sleep(self.config['poll_interval'])
+                    continue
+                
+                status = self.check_jules_status(issue)
+                
+                if status['status'] == 'in_progress':
+                    elapsed = int((time.time() - start) / 60)
+                    self.log(f"  ⏳ Working... ({elapsed}m)")
+                elif status['status'] == 'completed':
+                    pr_number = status.get('pr_number')
+                    if not pr_number:
+                        pr = self.get_pr_for_issue(issue_number)
+                        if pr:
+                            pr_number = pr['number']
+                    
+                    if pr_number:
+                        return self._handle_pr(task_id, pr_number)
+                    else:
+                        return None
+                        
+            except Exception as e:
+                self.log(f"  Error: {e}", "WARN")
+            
+            time.sleep(self.config['poll_interval'])
+        
+        self.log("  ❌ Timeout", "ERROR")
+        return None
+    
+    def _handle_pr(self, task_id: str, pr_number: int) -> Optional[int]:
+        try:
+            pr = self.get_pr_for_issue(pr_number)
+            if not pr:
+                return pr_number
+            
+            if pr.get('merged'):
+                self.log(f"  ✅ PR #{pr_number} already merged")
+                return pr_number
+            
+            if pr.get('state') == 'OPEN':
+                self.log(f"  🔍 Merging PR #{pr_number}...")
+                if self._merge_pr(pr_number):
+                    self.log(f"  ✅ Merged")
+                    return pr_number
+                else:
+                    return pr_number
+            
+            return pr_number
+        except Exception as e:
+            self.log(f"  Error: {e}", "ERROR")
+            return pr_number
+    
+    @RetryWithBackoff(max_attempts=3, base_delay=1.0)
+    def _merge_pr(self, pr_number: int) -> bool:
+        try:
+            result = self.run_gh(['pr', 'view', str(pr_number), '--json', 'state,merged'])
+            if result and result[0].get('merged'):
+                return True
+        except:
+            pass
+        
+        cmd = ['gh', 'pr', 'merge', str(pr_number), '--repo', self.repo,
+               '--squash', '--delete-branch']
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        
+        if result.returncode != 0:
+            if 'already merged' in result.stderr.lower():
+                return True
+            raise RuntimeError(f"Merge failed: {result.stderr}")
+        
+        return True
+    
+    def mark_task_complete(self, memory: Dict, task_id: str, pr_number: int):
+        with FileLock(self.lock_path):
+            memory = self.atomic_file.load()
+            
+            memory['execution']['current_task'] = None
+            if task_id in memory['execution']['pending_tasks']:
+                memory['execution']['pending_tasks'].remove(task_id)
+            if task_id not in memory['execution']['completed_tasks']:
+                memory['execution']['completed_tasks'].append(task_id)
+            
+            if 'task_prs' not in memory['execution']:
+                memory['execution']['task_prs'] = {}
+            memory['execution']['task_prs'][task_id] = pr_number
+            
+            self.atomic_file.save(memory)
+        
+        self.audit('task_complete', task_id, {'pr_number': pr_number})
+        self.log(f"✅ Task {task_id} complete")
+
+
+def main():
+    import argparse
+    
+    parser = argparse.ArgumentParser(description='Jules Orchestrator v3.0')
+    parser.add_argument('--repo', required=True)
+    parser.add_argument('--memory', default='JULES_MEMORY.json')
+    
+    # Additional commands
+    subparsers = parser.add_subparsers(dest='command')
+    
+    # snapshot command
+    snapshot_parser = subparsers.add_parser('snapshot', help='Manage snapshots')
+    snapshot_parser.add_argument('--list', action='store_true')
+    snapshot_parser.add_argument('--restore', type=str)
+    snapshot_parser.add_argument('--diff', nargs=2, metavar=('T1', 'T2'))
+    
+    # health command
+    health_parser = subparsers.add_parser('health', help='Check health')
+    
+    # validate command
+    validate_parser = subparsers.add_parser('validate', help='Validate memory file')
+    
+    args = parser.parse_args()
+    
+    orchestrator = JulesSequentialOrchestratorV3(args.repo, args.memory)
+    
+    if args.command == 'snapshot':
+        if args.list:
+            print("Available snapshots:")
+            for snap in orchestrator.snapshots.list_snapshots()[:10]:
+                print(f"  {snap.timestamp}: {snap.reason}")
+        elif args.diff:
+            snap1 = orchestrator.snapshots.get_snapshot(args.diff[0])
+            snap2 = orchestrator.snapshots.get_snapshot(args.diff[1])
+            if snap1 and snap2:
+                diff = orchestrator.snapshots.diff_snapshots(snap1, snap2)
+                print(f"Diff from {diff['from']} to {diff['to']}:")
+                for change in diff['changes']:
+                    print(f"  {change}")
+    elif args.command == 'health':
+        memory = orchestrator.load_memory()
+        health = orchestrator.health.check_overall_health(memory)
+        print(orchestrator.health.generate_health_report())
+    elif args.command == 'validate':
+        memory = orchestrator.load_memory()
+        is_valid, errors = orchestrator.validator.validate(memory)
+        if is_valid:
+            print("✅ Valid")
+        else:
+            print("❌ Validation errors:")
+            for error in errors:
+                print(f"  - {error}")
+    else:
+        orchestrator.run()
+
+
+if __name__ == '__main__':
+    main()

@@ -1,0 +1,984 @@
+#!/usr/bin/env python3
+"""
+Jules Orchestrator v4.0 - Production Ready
+All Phase 1-3 features with graceful dependency handling
+"""
+
+import json
+import subprocess
+import time
+import sys
+import os
+import re
+import signal
+import fcntl
+import errno
+import shutil
+import hashlib
+import threading
+import urllib.request
+import urllib.error
+from datetime import datetime, timedelta
+from pathlib import Path
+from string import Template
+from typing import Dict, List, Optional, Set, Tuple, Any
+from dataclasses import dataclass
+from enum import Enum
+
+
+# =============================================================================
+# CORE COMPONENTS (Always Available)
+# =============================================================================
+
+class FileLock:
+    """Process-level file lock using flock."""
+    def __init__(self, lock_path: Path):
+        self.lock_path = lock_path
+        self.lock_file = None
+        self.acquired = False
+    
+    def acquire(self, timeout: int = 30) -> bool:
+        start = time.time()
+        while time.time() - start < timeout:
+            try:
+                self.lock_file = open(self.lock_path, 'w')
+                fcntl.flock(self.lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                self.acquired = True
+                return True
+            except (IOError, OSError) as e:
+                if e.errno != errno.EAGAIN:
+                    raise
+                time.sleep(0.1)
+        return False
+    
+    def release(self):
+        if self.lock_file and self.acquired:
+            try:
+                fcntl.flock(self.lock_file.fileno(), fcntl.LOCK_UN)
+            except:
+                pass
+            try:
+                self.lock_file.close()
+            except:
+                pass
+            self.acquired = False
+    
+    def __enter__(self):
+        if not self.acquire():
+            raise RuntimeError(f"Could not acquire lock: {self.lock_path}")
+        return self
+    
+    def __exit__(self, *args):
+        self.release()
+
+
+class RetryWithBackoff:
+    """Exponential backoff retry decorator."""
+    def __init__(self, max_attempts: int = 3, base_delay: float = 1.0):
+        self.max_attempts = max_attempts
+        self.base_delay = base_delay
+    
+    def __call__(self, func):
+        def wrapper(*args, **kwargs):
+            for attempt in range(self.max_attempts):
+                try:
+                    return func(*args, **kwargs)
+                except Exception as e:
+                    if attempt == self.max_attempts - 1:
+                        raise
+                    delay = min(self.base_delay * (2 ** attempt), 60.0)
+                    print(f"  Retry {attempt + 1}/{self.max_attempts} after {delay}s: {e}")
+                    time.sleep(delay)
+            return None
+        return wrapper
+
+
+class AtomicJsonFile:
+    """Atomic JSON file operations with backup."""
+    def __init__(self, path: Path):
+        self.path = path
+        self.temp_path = path.parent / f".tmp.{path.name}.{os.getpid()}"
+    
+    def load(self) -> Optional[Dict]:
+        try:
+            with open(self.path, 'r') as f:
+                return json.load(f)
+        except FileNotFoundError:
+            return None
+        except json.JSONDecodeError:
+            backup = self.path.with_suffix('.json.backup')
+            if backup.exists():
+                with open(backup, 'r') as f:
+                    return json.load(f)
+            raise
+    
+    def save(self, data: Dict):
+        with open(self.temp_path, 'w') as f:
+            json.dump(data, f, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        
+        if self.path.exists():
+            shutil.copy2(self.path, self.path.with_suffix('.json.backup'))
+        
+        os.rename(self.temp_path, self.path)
+
+
+# =============================================================================
+# CONFIGURATION MANAGEMENT
+# =============================================================================
+
+class ConfigManager:
+    """Simple config file management."""
+    
+    DEFAULTS = {
+        'version': '4.0.0',
+        'poll_interval': 30,
+        'jules_timeout_minutes': 15,
+        'max_retries': 3,
+        'auto_merge': True,
+        'notifications': {
+            'slack_webhook': None,
+            'slack_channel': '#general',
+            'webhook_url': None,
+            'enabled': False
+        },
+        'cost_tracking': {
+            'enabled': True,
+            'cost_per_hour': 5.0
+        },
+        'dashboard': {
+            'enabled': True,
+            'refresh_interval': 30
+        }
+    }
+    
+    def __init__(self, config_path: Path):
+        self.config_path = config_path
+        self.config = self.DEFAULTS.copy()
+        self.load()
+    
+    def load(self):
+        if self.config_path.exists():
+            try:
+                with open(self.config_path) as f:
+                    user_config = json.load(f)
+                self._deep_update(self.config, user_config)
+            except:
+                pass
+    
+    def save(self):
+        with open(self.config_path, 'w') as f:
+            json.dump(self.config, f, indent=2)
+    
+    def _deep_update(self, base: Dict, update: Dict):
+        for key, value in update.items():
+            if key in base and isinstance(base[key], dict) and isinstance(value, dict):
+                self._deep_update(base[key], value)
+            else:
+                base[key] = value
+    
+    def get(self, path: str, default=None):
+        keys = path.split('.')
+        value = self.config
+        for key in keys:
+            if isinstance(value, dict) and key in value:
+                value = value[key]
+            else:
+                return default
+        return value
+
+
+# =============================================================================
+# NOTIFICATIONS (Works with urllib, no external deps)
+# =============================================================================
+
+class NotificationManager:
+    """Send notifications via Slack webhook or generic webhook."""
+    
+    def __init__(self, config: Dict):
+        self.slack_webhook = config.get('slack_webhook')
+        self.webhook_url = config.get('webhook_url')
+        self.slack_channel = config.get('slack_channel', '#general')
+        self.enabled = config.get('enabled', False) and bool(self.slack_webhook or self.webhook_url)
+    
+    def notify(self, event: str, message: str, details: Dict = None):
+        if not self.enabled:
+            return
+        
+        details = details or {}
+        emoji = {'start': '🚀', 'complete': '✅', 'failure': '❌', 'progress': '📊'}.get(event, '📢')
+        
+        # Slack webhook
+        if self.slack_webhook:
+            self._send_slack(emoji, message, details)
+        
+        # Generic webhook
+        if self.webhook_url:
+            self._send_webhook(event, message, details)
+    
+    def _send_slack(self, emoji: str, message: str, details: Dict):
+        """Send to Slack using urllib (no requests dependency)."""
+        try:
+            payload = {
+                'channel': self.slack_channel,
+                'username': 'Jules Orchestrator',
+                'icon_emoji': emoji,
+                'text': f"{emoji} {message}",
+                'attachments': [{
+                    'color': self._get_color(emoji),
+                    'fields': [{'title': k, 'value': str(v), 'short': True} for k, v in details.items()]
+                }]
+            }
+            
+            data = json.dumps(payload).encode('utf-8')
+            req = urllib.request.Request(
+                self.slack_webhook,
+                data=data,
+                headers={'Content-Type': 'application/json'},
+                method='POST'
+            )
+            urllib.request.urlopen(req, timeout=10)
+        except Exception as e:
+            print(f"  Slack error: {e}")
+    
+    def _send_webhook(self, event: str, message: str, details: Dict):
+        """Send to generic webhook."""
+        try:
+            payload = {
+                'event': event,
+                'message': message,
+                'details': details,
+                'timestamp': datetime.now().isoformat(),
+                'source': 'jules-orchestrator-v4'
+            }
+            
+            data = json.dumps(payload).encode('utf-8')
+            req = urllib.request.Request(
+                self.webhook_url,
+                data=data,
+                headers={'Content-Type': 'application/json'},
+                method='POST'
+            )
+            urllib.request.urlopen(req, timeout=10)
+        except Exception as e:
+            print(f"  Webhook error: {e}")
+    
+    def _get_color(self, emoji: str) -> str:
+        return {
+            '✅': 'good',
+            '❌': 'danger',
+            '🚀': 'good',
+            '📊': 'warning'
+        }.get(emoji, '#808080')
+
+
+# =============================================================================
+# COST TRACKING
+# =============================================================================
+
+class CostTracker:
+    """Track execution costs."""
+    def __init__(self, config: Dict, project_dir: Path):
+        self.enabled = config.get('enabled', True)
+        self.cost_per_hour = config.get('cost_per_hour', 5.0)
+        self.records: List[Dict] = []
+        self.costs_file = project_dir / 'costs.jsonl'
+    
+    def start_task(self, task_id: str):
+        if not self.enabled:
+            return
+        self.records.append({
+            'task_id': task_id,
+            'start': datetime.now().isoformat()
+        })
+    
+    def end_task(self, task_id: str):
+        if not self.enabled:
+            return
+        for r in self.records:
+            if r['task_id'] == task_id and 'end' not in r:
+                r['end'] = datetime.now().isoformat()
+                start = datetime.fromisoformat(r['start'])
+                end = datetime.fromisoformat(r['end'])
+                duration = (end - start).total_seconds() / 60
+                r['duration_min'] = duration
+                r['cost_usd'] = round((duration / 60) * self.cost_per_hour, 2)
+                
+                with open(self.costs_file, 'a') as f:
+                    f.write(json.dumps(r) + '\n')
+                return r
+        return None
+    
+    def get_summary(self) -> Optional[Dict]:
+        if not self.records:
+            return None
+        total_cost = sum(r.get('cost_usd', 0) for r in self.records)
+        total_time = sum(r.get('duration_min', 0) for r in self.records)
+        return {
+            'tasks': len(self.records),
+            'total_cost_usd': round(total_cost, 2),
+            'total_time_min': round(total_time, 2)
+        }
+
+
+# =============================================================================
+# DASHBOARD (Pure string.Template, no jinja2)
+# =============================================================================
+
+class DashboardGenerator:
+    """Generate HTML dashboard using string.Template."""
+    
+    HTML_TEMPLATE = '''<!DOCTYPE html>
+<html>
+<head>
+    <title>Jules Dashboard - $project</title>
+    <meta http-equiv="refresh" content="$refresh_interval">
+    <style>
+        body { font-family: -apple-system, sans-serif; margin: 40px; background: #f5f5f5; }
+        .container { max-width: 1000px; margin: 0 auto; }
+        .header { background: #4A5ABA; color: white; padding: 20px; border-radius: 8px; margin-bottom: 20px; }
+        .card { background: white; padding: 20px; border-radius: 8px; margin-bottom: 20px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
+        .metric { display: inline-block; margin-right: 40px; text-align: center; }
+        .metric-value { font-size: 32px; font-weight: bold; color: #4A5ABA; }
+        .metric-label { color: #666; font-size: 14px; }
+        .progress-bar { background: #e0e0e0; height: 20px; border-radius: 10px; overflow: hidden; }
+        .progress-fill { background: #4A5ABA; height: 100%; transition: width 0.5s; }
+        table { width: 100%; border-collapse: collapse; }
+        th, td { padding: 12px; text-align: left; border-bottom: 1px solid #ddd; }
+        th { background: #f8f9fa; }
+        .status-complete { color: #28a745; font-weight: bold; }
+        .status-progress { color: #ffc107; font-weight: bold; }
+        .status-failed { color: #dc3545; font-weight: bold; }
+        .status-pending { color: #6c757d; }
+        a { color: #4A5ABA; text-decoration: none; }
+        a:hover { text-decoration: underline; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>🤖 Jules Orchestrator Dashboard</h1>
+            <p>$project | Last updated: $updated</p>
+        </div>
+        
+        <div class="card">
+            <h2>Progress</h2>
+            <div class="progress-bar">
+                <div class="progress-fill" style="width: $progress_percent%"></div>
+            </div>
+            <p style="text-align: center; margin-top: 10px;">
+                <strong>$completed</strong> / <strong>$total</strong> tasks ($progress_percent%)
+            </p>
+        </div>
+        
+        <div class="card">
+            <div class="metric">
+                <div class="metric-value" style="color: #28a745;">$completed</div>
+                <div class="metric-label">Completed</div>
+            </div>
+            <div class="metric">
+                <div class="metric-value" style="color: #dc3545;">$failed</div>
+                <div class="metric-label">Failed</div>
+            </div>
+            <div class="metric">
+                <div class="metric-value" style="color: #6c757d;">$pending</div>
+                <div class="metric-label">Pending</div>
+            </div>
+            $cost_metric
+        </div>
+        
+        <div class="card">
+            <h2>Tasks</h2>
+            <table>
+                <thead>
+                    <tr>
+                        <th>ID</th>
+                        <th>Title</th>
+                        <th>Type</th>
+                        <th>Status</th>
+                        <th>Issue</th>
+                        <th>PR</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    $task_rows
+                </tbody>
+            </table>
+        </div>
+        
+        $current_task_section
+        
+        <div class="card" style="background: #f8f9fa; text-align: center; color: #666;">
+            <small>Generated by Jules Orchestrator v4.0</small>
+        </div>
+    </div>
+</body>
+</html>'''
+    
+    def __init__(self, config: Dict, project_dir: Path, repo: str):
+        self.enabled = config.get('enabled', True)
+        self.refresh_interval = config.get('refresh_interval', 30)
+        self.output_dir = project_dir / '.jules-dashboard'
+        self.repo = repo
+        if self.enabled:
+            self.output_dir.mkdir(parents=True, exist_ok=True)
+    
+    def generate(self, memory: Dict, cost_summary: Optional[Dict] = None):
+        if not self.enabled:
+            return
+        
+        total = len(memory['plan']['tasks'])
+        completed = len(memory['execution']['completed_tasks'])
+        failed = len(memory['execution']['failed_tasks'])
+        pending = len(memory['execution']['pending_tasks'])
+        percent = int((completed / total * 100)) if total else 0
+        
+        # Build task rows
+        task_rows = []
+        for task in memory['plan']['tasks']:
+            tid = task['id']
+            if tid in memory['execution']['completed_tasks']:
+                status = 'complete'
+                status_class = 'status-complete'
+            elif tid in memory['execution']['failed_tasks']:
+                status = 'failed'
+                status_class = 'status-failed'
+            elif tid == memory['execution'].get('current_task'):
+                status = 'in progress'
+                status_class = 'status-progress'
+            else:
+                status = 'pending'
+                status_class = 'status-pending'
+            
+            issue_id = memory['execution'].get('task_issues', {}).get(tid, '')
+            pr_id = memory['execution'].get('task_prs', {}).get(tid, '')
+            
+            issue_link = f'<a href="https://github.com/{self.repo}/issues/{issue_id}">#{issue_id}</a>' if issue_id else '-'
+            pr_link = f'<a href="https://github.com/{self.repo}/pull/{pr_id}">#{pr_id}</a>' if pr_id else '-'
+            
+            task_rows.append(f'''
+                <tr>
+                    <td>{tid}</td>
+                    <td>{task['title'][:50]}</td>
+                    <td>{task['type']}</td>
+                    <td class="{status_class}">{status.upper()}</td>
+                    <td>{issue_link}</td>
+                    <td>{pr_link}</td>
+                </tr>
+            ''')
+        
+        # Cost metric
+        cost_metric = ''
+        if cost_summary:
+            cost_metric = f'''
+            <div class="metric">
+                <div class="metric-value" style="color: #4A5ABA;">${cost_summary['total_cost_usd']}</div>
+                <div class="metric-label">Est. Cost</div>
+            </div>
+            '''
+        
+        # Current task section
+        current_task_section = ''
+        if memory['execution'].get('current_task'):
+            current_task_section = f'''
+            <div class="card">
+                <h2>Current Task</h2>
+                <p><strong>{memory['execution']['current_task']}</strong> is currently executing</p>
+            </div>
+            '''
+        
+        # Build template
+        template = Template(self.HTML_TEMPLATE)
+        html = template.substitute(
+            project=memory['project']['name'],
+            updated=datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+            total=total,
+            completed=completed,
+            failed=failed,
+            pending=pending,
+            progress_percent=percent,
+            refresh_interval=self.refresh_interval,
+            task_rows='\n'.join(task_rows),
+            cost_metric=cost_metric,
+            current_task_section=current_task_section
+        )
+        
+        output = self.output_dir / 'index.html'
+        with open(output, 'w') as f:
+            f.write(html)
+        
+        print(f"  📊 Dashboard: file://{output.absolute()}")
+
+
+# =============================================================================
+# MAIN ORCHESTRATOR
+# =============================================================================
+
+class JulesOrchestratorV4:
+    """Production-ready Jules orchestrator v4."""
+    
+    def __init__(self, repo: str, memory_file: str = "JULES_MEMORY.json",
+                 config_file: str = "jules-config.json"):
+        self.repo = repo
+        self.memory_path = Path(memory_file)
+        self.project_dir = self.memory_path.parent
+        
+        # Config
+        self.config_path = self.project_dir / config_file
+        self.config = ConfigManager(self.config_path)
+        
+        # Core
+        self.lock_path = self.memory_path.with_suffix('.lock')
+        self.atomic_file = AtomicJsonFile(self.memory_path)
+        
+        # Features
+        self.notifications = NotificationManager(self.config.get('notifications', {}))
+        self.costs = CostTracker(self.config.get('cost_tracking', {}), self.project_dir)
+        self.dashboard = DashboardGenerator(self.config.get('dashboard', {}), self.project_dir, repo)
+        
+        # State
+        self.running = False
+        self.shutdown_requested = False
+        signal.signal(signal.SIGINT, self._signal_handler)
+        signal.signal(signal.SIGTERM, self._signal_handler)
+    
+    def _signal_handler(self, signum, frame):
+        print(f"\n[{datetime.now().strftime('%H:%M:%S')}] Received signal {signum}, shutting down gracefully...")
+        self.shutdown_requested = True
+        self.running = False
+    
+    def log(self, message: str, level: str = "INFO"):
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        print(f"[{timestamp}] [{level}] {message}", flush=True)
+        
+        log_file = self.project_dir / 'jules-orchestrator.log'
+        with open(log_file, 'a') as f:
+            f.write(f"[{timestamp}] [{level}] {message}\n")
+    
+    def load_memory(self) -> Dict:
+        with FileLock(self.lock_path):
+            memory = self.atomic_file.load()
+            if memory is None:
+                raise RuntimeError(f"Memory file not found: {self.memory_path}")
+            return memory
+    
+    def save_memory(self, memory: Dict):
+        with FileLock(self.lock_path):
+            memory['updated_at'] = datetime.now().isoformat()
+            self.atomic_file.save(memory)
+    
+    @RetryWithBackoff(max_attempts=3, base_delay=1.0)
+    def run_gh(self, args: List[str]) -> List:
+        cmd = ['gh'] + args + ['--repo', self.repo]
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            raise RuntimeError(f"gh failed: {result.stderr}")
+        try:
+            return json.loads(result.stdout) if result.stdout else []
+        except:
+            return []
+    
+    def run(self):
+        """Main execution loop."""
+        self.log("=" * 70)
+        self.log("🤖 JULES ORCHESTRATOR v4.0")
+        self.log("Production Ready: File Locking + Atomic Writes + Retry + Notifications + Dashboard + Cost Tracking")
+        self.log("=" * 70)
+        
+        # Save default config if not exists
+        if not self.config_path.exists():
+            self.config.save()
+            self.log(f"Created default config: {self.config_path}")
+        
+        # Show feature status
+        self.log(f"Features: Notifications={'✅' if self.notifications.enabled else '❌'} " +
+                 f"Dashboard={'✅' if self.dashboard.enabled else '❌'} " +
+                 f"Cost Tracking={'✅' if self.costs.enabled else '❌'}")
+        
+        # Acquire lock
+        lock = FileLock(self.lock_path)
+        if not lock.acquire(timeout=5):
+            self.log("❌ Another instance is running. Exiting.", "ERROR")
+            sys.exit(1)
+        
+        try:
+            memory = self.load_memory()
+            
+            self.log(f"Project: {memory['project']['name']}")
+            self.log(f"Tasks: {len(memory['plan']['tasks'])}")
+            
+            # Notify start
+            self.notifications.notify('start', f"Starting {memory['project']['name']}", {
+                'tasks': len(memory['plan']['tasks']),
+                'repo': self.repo
+            })
+            
+            self.running = True
+            
+            while self.running and not self.shutdown_requested:
+                memory = self.load_memory()
+                
+                # Update dashboard
+                if self.dashboard:
+                    self.dashboard.generate(memory, self.costs.get_summary())
+                
+                # Check completion
+                if not memory['execution']['pending_tasks']:
+                    self.log("\n" + "=" * 70)
+                    self.log("✅ ALL TASKS COMPLETED!")
+                    self.log("=" * 70)
+                    
+                    # Final notification
+                    summary = self.costs.get_summary()
+                    self.notifications.notify('complete', 
+                        f"{memory['project']['name']} complete!", {
+                        'tasks': len(memory['plan']['tasks']),
+                        'cost': f"${summary.get('total_cost_usd', 0)}" if summary else 'N/A'
+                    })
+                    break
+                
+                # Get next task
+                task = self.get_next_ready_task(memory)
+                if not task:
+                    self.log("⏳ No ready tasks (waiting for dependencies)...")
+                    time.sleep(self.config.get('poll_interval', 30))
+                    continue
+                
+                # Execute
+                success = self.execute_single_task(memory, task)
+                if not success and not self.shutdown_requested:
+                    self.notifications.notify('failure', f"Task {task['id']} failed")
+                    time.sleep(5)
+                
+                if not self.shutdown_requested:
+                    time.sleep(2)
+            
+            # Final dashboard
+            if self.dashboard:
+                self.dashboard.generate(memory, self.costs.get_summary())
+            
+            # Summary
+            summary = self.costs.get_summary()
+            if summary:
+                self.log(f"\n💰 Cost Summary: ${summary['total_cost_usd']} for {summary['tasks']} tasks")
+            
+        finally:
+            lock.release()
+    
+    def get_next_ready_task(self, memory: Dict) -> Optional[Dict]:
+        current = memory.get('execution', {}).get('current_task')
+        if current:
+            self.log(f"Task {current} still in progress")
+            return None
+        
+        completed = set(memory['execution'].get('completed_tasks', []))
+        pending = memory['execution'].get('pending_tasks', [])
+        
+        for task in memory['plan']['tasks']:
+            tid = task['id']
+            if tid not in pending:
+                continue
+            deps = set(task.get('dependencies', []))
+            if deps.issubset(completed):
+                return task
+        return None
+    
+    def execute_single_task(self, memory: Dict, task: Dict) -> bool:
+        task_id = task['id']
+        
+        self.log(f"\n{'='*70}")
+        self.log(f"🚀 TASK: {task_id}")
+        self.log(f"{'='*70}")
+        
+        # Start cost tracking
+        self.costs.start_task(task_id)
+        
+        try:
+            existing = self.get_issue_for_task(task_id)
+            if existing:
+                self.log(f"Issue #{existing['number']} exists")
+                issue_number = existing['number']
+            else:
+                self.log("Creating issue...")
+                issue_number = self.create_github_issue(task)
+                if not issue_number:
+                    raise RuntimeError("Failed to create issue")
+                
+                memory['execution']['current_task'] = task_id
+                if 'task_issues' not in memory['execution']:
+                    memory['execution']['task_issues'] = {}
+                memory['execution']['task_issues'][task_id] = issue_number
+                self.save_memory(memory)
+                
+                time.sleep(10)
+            
+            # Poll
+            pr_number = self.poll_for_completion(task, issue_number)
+            
+            if pr_number:
+                self.mark_task_complete(memory, task_id, pr_number)
+                self.costs.end_task(task_id)
+                
+                # Progress notification
+                total = len(memory['plan']['tasks'])
+                completed = len(memory['execution']['completed_tasks']) + 1
+                self.notifications.notify('progress', 
+                    f"Task {task_id} complete ({completed}/{total})",
+                    {'task': task['title'][:50]})
+                return True
+            else:
+                memory['execution']['failed_tasks'].append(task_id)
+                memory['execution']['current_task'] = None
+                self.save_memory(memory)
+                self.costs.end_task(task_id)
+                return False
+                
+        except Exception as e:
+            self.log(f"❌ Error: {e}", "ERROR")
+            memory['execution']['failed_tasks'].append(task_id)
+            memory['execution']['current_task'] = None
+            self.save_memory(memory)
+            self.costs.end_task(task_id)
+            return False
+    
+    def get_issue_for_task(self, task_id: str) -> Optional[Dict]:
+        try:
+            result = self.run_gh(['issue', 'list', '--search', f'[AUTO][{task_id}]',
+                                  '--state', 'all', '--json',
+                                  'number,title,state,labels,comments'])
+            return result[0] if result else None
+        except Exception:
+            return None
+    
+    def get_pr_for_issue(self, issue_number: int) -> Optional[Dict]:
+        try:
+            result = self.run_gh(['pr', 'list', '--state', 'all', '--search',
+                                  f'#{issue_number}', '--json',
+                                  'number,title,state,author,merged'])
+            if result:
+                for pr in result:
+                    if pr.get('author', {}).get('login') == 'google-labs-jules':
+                        return pr
+            return None
+        except Exception:
+            return None
+    
+    def create_github_issue(self, task: Dict) -> Optional[int]:
+        title = f"[AUTO][{task['id']}] {task['title']}"
+        body = self._format_issue_body(task)
+        
+        cmd = ['gh', 'issue', 'create', '--repo', self.repo,
+               '--title', title, '--body', body, '--label', 'jules']
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        
+        if result.returncode != 0:
+            raise RuntimeError(f"Failed to create issue: {result.stderr}")
+        
+        url = result.stdout.strip()
+        match = re.search(r'/issues/(\d+)', url)
+        if not match:
+            raise RuntimeError(f"Could not parse URL: {url}")
+        
+        return int(match.group(1))
+    
+    def _format_issue_body(self, task: Dict) -> str:
+        memory = self.load_memory()
+        completed = set(memory['execution'].get('completed_tasks', []))
+        
+        body = f"""## Task Definition
+- **ID**: {task['id']}
+- **Type**: {task['type']}
+- **Priority**: High
+
+## Description
+{task['description']}
+
+## Expected Files
+"""
+        for f in task.get('files_expected', []):
+            body += f"- `{f}`\n"
+        
+        body += "\n## Acceptance Criteria\n"
+        for i, criteria in enumerate(task.get('acceptance_criteria', []), 1):
+            body += f"{i}. {criteria}\n"
+        
+        deps = task.get('dependencies', [])
+        if deps:
+            body += "\n## Dependencies\n"
+            for dep in deps:
+                status = "✅" if dep in completed else "⏳"
+                body += f"- {dep} {status}\n"
+        
+        body += """
+## Jules Instructions
+**CRITICAL**: Execute EXACTLY as specified.
+
+---
+*Generated by Jules Orchestrator v4.0*
+"""
+        return body
+    
+    def check_jules_status(self, issue: Dict) -> Dict:
+        for comment in issue.get('comments', []):
+            author = comment.get('author', {}).get('login', '')
+            if author == 'google-labs-jules':
+                body = comment.get('body', '')
+                pr_match = re.search(r'(?:PR|pull request)\s*#(\d+)', body, re.IGNORECASE)
+                if pr_match:
+                    return {'status': 'completed', 'pr_number': int(pr_match.group(1)), 'has_pr': True}
+                elif 'on it' in body.lower():
+                    return {'status': 'in_progress', 'has_pr': False}
+        return {'status': 'unknown', 'has_pr': False}
+    
+    def poll_for_completion(self, task: Dict, issue_number: int) -> Optional[int]:
+        task_id = task['id']
+        timeout = self.config.get('jules_timeout_minutes', 15) * 60
+        start = time.time()
+        
+        self.log(f"Polling (timeout: {timeout//60}m)...")
+        
+        while time.time() - start < timeout:
+            if self.shutdown_requested:
+                return None
+            
+            try:
+                issue = self.get_issue_for_task(task_id)
+                if not issue:
+                    time.sleep(self.config.get('poll_interval', 30))
+                    continue
+                
+                status = self.check_jules_status(issue)
+                
+                if status['status'] == 'in_progress':
+                    elapsed = int((time.time() - start) / 60)
+                    self.log(f"  ⏳ Working... ({elapsed}m)")
+                elif status['status'] == 'completed':
+                    pr_number = status.get('pr_number')
+                    if not pr_number:
+                        pr = self.get_pr_for_issue(issue_number)
+                        if pr:
+                            pr_number = pr['number']
+                    
+                    if pr_number:
+                        return self._handle_pr(task_id, pr_number)
+                    else:
+                        return None
+                        
+            except Exception as e:
+                self.log(f"  Poll error: {e}", "WARN")
+            
+            time.sleep(self.config.get('poll_interval', 30))
+        
+        self.log("  ❌ Timeout", "ERROR")
+        return None
+    
+    def _handle_pr(self, task_id: str, pr_number: int) -> Optional[int]:
+        try:
+            pr = self.get_pr_for_issue(pr_number)
+            if not pr:
+                return pr_number
+            
+            if pr.get('merged'):
+                self.log(f"  ✅ PR #{pr_number} already merged")
+                return pr_number
+            
+            if pr.get('state') == 'OPEN':
+                if self.config.get('auto_merge', True):
+                    self.log(f"  🔍 Merging PR #{pr_number}...")
+                    if self._merge_pr(pr_number):
+                        self.log(f"  ✅ Merged")
+                        return pr_number
+                else:
+                    self.log(f"  ⏸️  Manual merge required")
+                    return pr_number
+            
+            return pr_number
+        except Exception as e:
+            self.log(f"  PR error: {e}", "ERROR")
+            return pr_number
+    
+    @RetryWithBackoff(max_attempts=3, base_delay=1.0)
+    def _merge_pr(self, pr_number: int) -> bool:
+        try:
+            result = self.run_gh(['pr', 'view', str(pr_number), '--json', 'state,merged'])
+            if result and result[0].get('merged'):
+                return True
+        except:
+            pass
+        
+        cmd = ['gh', 'pr', 'merge', str(pr_number), '--repo', self.repo,
+               '--squash', '--delete-branch']
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        
+        if result.returncode != 0:
+            if 'already merged' in result.stderr.lower():
+                return True
+            raise RuntimeError(f"Merge failed: {result.stderr}")
+        
+        return True
+    
+    def mark_task_complete(self, memory: Dict, task_id: str, pr_number: int):
+        with FileLock(self.lock_path):
+            memory = self.atomic_file.load()
+            
+            memory['execution']['current_task'] = None
+            if task_id in memory['execution']['pending_tasks']:
+                memory['execution']['pending_tasks'].remove(task_id)
+            if task_id not in memory['execution']['completed_tasks']:
+                memory['execution']['completed_tasks'].append(task_id)
+            
+            if 'task_prs' not in memory['execution']:
+                memory['execution']['task_prs'] = {}
+            memory['execution']['task_prs'][task_id] = pr_number
+            
+            self.atomic_file.save(memory)
+        
+        self.log(f"✅ Task {task_id} complete")
+
+
+def main():
+    import argparse
+    
+    parser = argparse.ArgumentParser(
+        description='Jules Orchestrator v4.0 - Production Ready',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog='''
+Examples:
+  # Run orchestrator
+  %(prog)s --repo org/project
+
+  # Use custom config
+  %(prog)s --repo org/project --config my-config.json
+
+  # Use custom memory file
+  %(prog)s --repo org/project --memory JULES_MEMORY.json
+
+Config file (jules-config.json):
+  {
+    "notifications": {
+      "slack_webhook": "https://hooks.slack.com/...",
+      "enabled": true
+    },
+    "cost_tracking": {
+      "enabled": true,
+      "cost_per_hour": 5.0
+    },
+    "dashboard": {
+      "enabled": true,
+      "refresh_interval": 30
+    }
+  }
+        '''
+    )
+    parser.add_argument('--repo', required=True, help='GitHub repo (org/name)')
+    parser.add_argument('--memory', default='JULES_MEMORY.json', help='Memory file')
+    parser.add_argument('--config', default='jules-config.json', help='Config file')
+    args = parser.parse_args()
+    
+    orchestrator = JulesOrchestratorV4(args.repo, args.memory, args.config)
+    orchestrator.run()
+
+
+if __name__ == '__main__':
+    main()

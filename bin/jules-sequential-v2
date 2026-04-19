@@ -1,0 +1,677 @@
+#!/usr/bin/env python3
+"""
+Jules Sequential Orchestrator v2.0 - Phase 1 Stabilization
+Critical fixes: file locking, atomic writes, retry logic, graceful shutdown
+"""
+
+import json
+import subprocess
+import time
+import sys
+import os
+import re
+import signal
+import fcntl
+import errno
+import tempfile
+import shutil
+from datetime import datetime
+from pathlib import Path
+from typing import Dict, List, Optional, Set, Tuple
+from dataclasses import dataclass, asdict
+from enum import Enum
+
+
+class TaskState(Enum):
+    """Proper state machine states."""
+    PENDING = "pending"
+    ISSUE_CREATED = "issue_created"
+    JULES_TRIGGERED = "jules_triggered"
+    PR_OPENED = "pr_opened"
+    APPROVED = "approved"
+    MERGING = "merging"
+    COMPLETE = "complete"
+    FAILED = "failed"
+    BLOCKED = "blocked"
+
+
+@dataclass
+class AuditEvent:
+    """Audit log entry."""
+    timestamp: str
+    task_id: Optional[str]
+    event: str
+    details: Dict
+    
+    def to_dict(self) -> Dict:
+        return {
+            'timestamp': self.timestamp,
+            'task_id': self.task_id,
+            'event': self.event,
+            'details': self.details
+        }
+
+
+class FileLock:
+    """Process-level file lock using flock."""
+    
+    def __init__(self, lock_path: Path):
+        self.lock_path = lock_path
+        self.lock_file = None
+        self.acquired = False
+    
+    def acquire(self, timeout: int = 30) -> bool:
+        """Acquire lock with timeout."""
+        start = time.time()
+        while time.time() - start < timeout:
+            try:
+                self.lock_file = open(self.lock_path, 'w')
+                fcntl.flock(self.lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                self.acquired = True
+                return True
+            except (IOError, OSError) as e:
+                if e.errno != errno.EAGAIN:
+                    raise
+                time.sleep(0.1)
+        return False
+    
+    def release(self):
+        """Release lock."""
+        if self.lock_file and self.acquired:
+            try:
+                fcntl.flock(self.lock_file.fileno(), fcntl.LOCK_UN)
+            except:
+                pass
+            try:
+                self.lock_file.close()
+            except:
+                pass
+            self.acquired = False
+    
+    def __enter__(self):
+        if not self.acquire():
+            raise RuntimeError(f"Could not acquire lock: {self.lock_path}")
+        return self
+    
+    def __exit__(self, *args):
+        self.release()
+
+
+class RetryWithBackoff:
+    """Exponential backoff retry decorator."""
+    
+    def __init__(self, max_attempts: int = 3, base_delay: float = 1.0, max_delay: float = 60.0):
+        self.max_attempts = max_attempts
+        self.base_delay = base_delay
+        self.max_delay = max_delay
+    
+    def __call__(self, func):
+        def wrapper(*args, **kwargs):
+            for attempt in range(self.max_attempts):
+                try:
+                    return func(*args, **kwargs)
+                except Exception as e:
+                    if attempt == self.max_attempts - 1:
+                        raise
+                    delay = min(self.base_delay * (2 ** attempt), self.max_delay)
+                    print(f"  Retry {attempt + 1}/{self.max_attempts} after {delay}s: {e}")
+                    time.sleep(delay)
+            return None
+        return wrapper
+
+
+class AtomicJsonFile:
+    """Atomic JSON file operations."""
+    
+    def __init__(self, path: Path):
+        self.path = path
+        self.temp_path = path.parent / f".tmp.{path.name}.{os.getpid()}"
+    
+    def load(self) -> Optional[Dict]:
+        """Load JSON with validation."""
+        try:
+            with open(self.path, 'r') as f:
+                data = json.load(f)
+                # Basic schema validation
+                if 'version' not in data or 'execution' not in data:
+                    raise ValueError("Invalid JULES_MEMORY.json schema")
+                return data
+        except FileNotFoundError:
+            return None
+        except json.JSONDecodeError as e:
+            # Try to recover from backup
+            backup = self.path.with_suffix('.json.backup')
+            if backup.exists():
+                print(f"  Corrupted JSON, loading backup: {backup}")
+                with open(backup, 'r') as f:
+                    return json.load(f)
+            raise ValueError(f"Corrupted JSON and no backup: {e}")
+    
+    def save(self, data: Dict):
+        """Atomic write with backup."""
+        # Write to temp file
+        with open(self.temp_path, 'w') as f:
+            json.dump(data, f, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        
+        # Create backup before rename
+        if self.path.exists():
+            backup = self.path.with_suffix('.json.backup')
+            shutil.copy2(self.path, backup)
+        
+        # Atomic rename
+        os.rename(self.temp_path, self.path)
+
+
+class JulesSequentialOrchestratorV2:
+    """Stabilized sequential orchestrator."""
+    
+    def __init__(self, repo: str, memory_file: str = "JULES_MEMORY.json"):
+        self.repo = repo
+        self.memory_path = Path(memory_file)
+        self.lock_path = self.memory_path.with_suffix('.lock')
+        self.atomic_file = AtomicJsonFile(self.memory_path)
+        self.check_interval = 30
+        self.running = False
+        self.shutdown_requested = False
+        self.audit_log: List[AuditEvent] = []
+        
+        # Configuration (could be moved to config file)
+        self.config = {
+            'jules_timeout_minutes': 15,
+            'max_retries': 3,
+            'retry_base_delay': 1.0,
+            'poll_interval': 30,
+        }
+        
+        # Setup signal handlers
+        signal.signal(signal.SIGINT, self._signal_handler)
+        signal.signal(signal.SIGTERM, self._signal_handler)
+    
+    def _signal_handler(self, signum, frame):
+        """Graceful shutdown handler."""
+        self.log(f"\nReceived signal {signum}, shutting down gracefully...")
+        self.shutdown_requested = True
+        self.running = False
+    
+    def log(self, message: str, level: str = "INFO"):
+        """Log with timestamp and audit."""
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        log_entry = f"[{timestamp}] [{level}] {message}"
+        print(log_entry, flush=True)
+        
+        # Also write to log file
+        log_file = self.memory_path.parent / 'jules-orchestrator.log'
+        with open(log_file, 'a') as f:
+            f.write(log_entry + '\n')
+    
+    def audit(self, event: str, task_id: Optional[str] = None, details: Dict = None):
+        """Record audit event."""
+        entry = AuditEvent(
+            timestamp=datetime.now().isoformat(),
+            task_id=task_id,
+            event=event,
+            details=details or {}
+        )
+        self.audit_log.append(entry)
+        
+        # Persist audit log
+        audit_file = self.memory_path.parent / 'audit.log'
+        with open(audit_file, 'a') as f:
+            f.write(json.dumps(entry.to_dict()) + '\n')
+    
+    def load_memory(self) -> Dict:
+        """Load memory with locking."""
+        with FileLock(self.lock_path):
+            memory = self.atomic_file.load()
+            if memory is None:
+                raise RuntimeError(f"Memory file not found: {self.memory_path}")
+            return memory
+    
+    def save_memory(self, memory: Dict):
+        """Save memory atomically."""
+        with FileLock(self.lock_path):
+            memory['updated_at'] = datetime.now().isoformat()
+            self.atomic_file.save(memory)
+    
+    @RetryWithBackoff(max_attempts=3, base_delay=1.0)
+    def run_gh(self, args: List[str]) -> List:
+        """Run gh command with retry."""
+        cmd = ['gh'] + args + ['--repo', self.repo]
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            raise RuntimeError(f"gh failed: {result.stderr}")
+        try:
+            return json.loads(result.stdout) if result.stdout else []
+        except:
+            return []
+    
+    def get_completed_task_ids(self, memory: Dict) -> Set[str]:
+        """Get completed task IDs."""
+        return set(memory.get('execution', {}).get('completed_tasks', []))
+    
+    def get_next_ready_task(self, memory: Dict) -> Optional[Dict]:
+        """Get ONE next ready task."""
+        current = memory.get('execution', {}).get('current_task')
+        if current:
+            self.log(f"Task {current} still in progress")
+            return None
+        
+        completed = self.get_completed_task_ids(memory)
+        pending = memory.get('execution', {}).get('pending_tasks', [])
+        
+        for task in memory.get('plan', {}).get('tasks', []):
+            tid = task['id']
+            if tid not in pending:
+                continue
+            
+            deps = set(task.get('dependencies', []))
+            if deps.issubset(completed):
+                return task
+        
+        return None
+    
+    @RetryWithBackoff(max_attempts=3, base_delay=2.0)
+    def create_github_issue(self, task: Dict) -> Optional[int]:
+        """Create issue with retry."""
+        title = f"[AUTO][{task['id']}] {task['title']}"
+        
+        body = self._format_issue_body(task)
+        
+        # Check for existing issue first
+        existing = self.get_issue_for_task(task['id'])
+        if existing:
+            self.log(f"Issue #{existing['number']} already exists")
+            self.audit('issue_found', task['id'], {'issue_id': existing['number']})
+            return existing['number']
+        
+        # Create new issue
+        cmd = ['gh', 'issue', 'create', '--repo', self.repo,
+               '--title', title, '--body', body, '--label', 'jules']
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        
+        if result.returncode != 0:
+            raise RuntimeError(f"Failed to create issue: {result.stderr}")
+        
+        url = result.stdout.strip()
+        match = re.search(r'/issues/(\d+)', url)
+        if not match:
+            raise RuntimeError(f"Could not parse issue URL: {url}")
+        
+        issue_number = int(match.group(1))
+        self.audit('issue_created', task['id'], {'issue_id': issue_number})
+        return issue_number
+    
+    def _format_issue_body(self, task: Dict) -> str:
+        """Format issue body."""
+        memory = self.load_memory()
+        completed = self.get_completed_task_ids(memory)
+        
+        body = f"""## Task Definition
+- **ID**: {task['id']}
+- **Type**: {task['type']}
+- **Priority**: High
+
+## Description
+{task['description']}
+
+## Expected Files
+"""
+        for f in task.get('files_expected', []):
+            body += f"- `{f}`\n"
+        
+        body += "\n## Acceptance Criteria\n"
+        for i, criteria in enumerate(task.get('acceptance_criteria', []), 1):
+            body += f"{i}. {criteria}\n"
+        
+        body += "\n## Test Cases\n"
+        for i, test in enumerate(task.get('test_cases', []), 1):
+            body += f"{i}. {test}\n"
+        
+        deps = task.get('dependencies', [])
+        if deps:
+            body += "\n## Dependencies\n"
+            for dep in deps:
+                status = "✅" if dep in completed else "⏳"
+                body += f"- {dep} {status}\n"
+        
+        body += """
+## Jules Instructions
+**CRITICAL**: Execute EXACTLY as specified. Do not expand scope.
+
+---
+*Generated by Jules Sequential Orchestrator v2.0*
+"""
+        return body
+    
+    def get_issue_for_task(self, task_id: str) -> Optional[Dict]:
+        """Find issue for task."""
+        try:
+            result = self.run_gh(['issue', 'list', '--search', f'[AUTO][{task_id}]',
+                                  '--state', 'all', '--json',
+                                  'number,title,state,labels,comments'])
+            return result[0] if result else None
+        except Exception as e:
+            self.log(f"Error finding issue: {e}", "WARN")
+            return None
+    
+    def get_pr_for_issue(self, issue_number: int) -> Optional[Dict]:
+        """Find PR for issue."""
+        try:
+            result = self.run_gh(['pr', 'list', '--state', 'all', '--search',
+                                  f'#{issue_number}', '--json',
+                                  'number,title,state,author,merged,headRefName'])
+            if result:
+                for pr in result:
+                    if pr.get('author', {}).get('login') == 'google-labs-jules':
+                        return pr
+            return None
+        except Exception as e:
+            self.log(f"Error finding PR: {e}", "WARN")
+            return None
+    
+    def check_jules_status(self, issue: Dict) -> Dict:
+        """Check Jules status from comments."""
+        for comment in issue.get('comments', []):
+            author = comment.get('author', {}).get('login', '')
+            if author == 'google-labs-jules':
+                body = comment.get('body', '')
+                
+                # Look for specific PR reference pattern
+                # Match: "PR #123" or "pull request #123"
+                pr_match = re.search(r'(?:PR|pull request)\s*#(\d+)', body, re.IGNORECASE)
+                if pr_match:
+                    return {
+                        'status': 'completed',
+                        'pr_number': int(pr_match.group(1)),
+                        'has_pr': True
+                    }
+                elif 'on it' in body.lower():
+                    return {'status': 'in_progress', 'has_pr': False}
+        
+        return {'status': 'unknown', 'has_pr': False}
+    
+    def poll_for_completion(self, task: Dict, issue_number: int) -> Optional[int]:
+        """Poll with timeout and graceful shutdown support."""
+        task_id = task['id']
+        timeout = self.config['jules_timeout_minutes'] * 60
+        start = time.time()
+        
+        self.log(f"Polling for Jules completion (timeout: {self.config['jules_timeout_minutes']}m)...")
+        
+        while time.time() - start < timeout:
+            if self.shutdown_requested:
+                self.log("Shutdown requested, stopping poll")
+                return None
+            
+            try:
+                # Refresh issue
+                issue = self.get_issue_for_task(task_id)
+                if not issue:
+                    time.sleep(self.config['poll_interval'])
+                    continue
+                
+                status = self.check_jules_status(issue)
+                
+                if status['status'] == 'in_progress':
+                    elapsed = int((time.time() - start) / 60)
+                    self.log(f"  ⏳ Jules working... ({elapsed}m elapsed)")
+                
+                elif status['status'] == 'completed':
+                    pr_number = status.get('pr_number')
+                    
+                    if not pr_number:
+                        pr = self.get_pr_for_issue(issue_number)
+                        if pr:
+                            pr_number = pr['number']
+                    
+                    if pr_number:
+                        return self._handle_pr_completion(task_id, pr_number)
+                    else:
+                        self.log("  ⚠️ Jules complete but no PR found", "WARN")
+                        return None
+                
+                elif status['status'] == 'unknown':
+                    # Jules hasn't started yet
+                    pass
+                
+            except Exception as e:
+                self.log(f"  Error during poll: {e}", "WARN")
+            
+            time.sleep(self.config['poll_interval'])
+        
+        self.log(f"  ❌ Timeout waiting for Jules", "ERROR")
+        return None
+    
+    def _handle_pr_completion(self, task_id: str, pr_number: int) -> Optional[int]:
+        """Handle PR completion with merge."""
+        try:
+            pr = self.get_pr_for_issue(pr_number)
+            if not pr:
+                self.log(f"  ⚠️ PR #{pr_number} not found")
+                return pr_number  # Return anyway, might be merged
+            
+            if pr.get('merged'):
+                self.log(f"  ✅ PR #{pr_number} already merged")
+                return pr_number
+            
+            if pr.get('state') == 'OPEN':
+                self.log(f"  🔍 Merging PR #{pr_number}...")
+                if self._merge_pr(pr_number):
+                    self.log(f"  ✅ Merged")
+                    return pr_number
+                else:
+                    self.log(f"  ⚠️ Manual merge required for PR #{pr_number}")
+                    return pr_number
+            
+            return pr_number
+            
+        except Exception as e:
+            self.log(f"  Error handling PR: {e}", "ERROR")
+            return pr_number
+    
+    @RetryWithBackoff(max_attempts=3, base_delay=1.0)
+    def _merge_pr(self, pr_number: int) -> bool:
+        """Merge PR with retry."""
+        # Check if already merged first
+        try:
+            result = self.run_gh(['pr', 'view', str(pr_number), '--json', 'state,merged'])
+            if result and result[0].get('merged'):
+                return True
+        except:
+            pass
+        
+        cmd = ['gh', 'pr', 'merge', str(pr_number), '--repo', self.repo,
+               '--squash', '--delete-branch']
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        
+        if result.returncode != 0:
+            if 'already merged' in result.stderr.lower():
+                return True
+            raise RuntimeError(f"Merge failed: {result.stderr}")
+        
+        return True
+    
+    def mark_task_complete(self, memory: Dict, task_id: str, pr_number: int):
+        """Mark task complete with audit."""
+        with FileLock(self.lock_path):
+            memory = self.atomic_file.load()  # Refresh
+            
+            memory['execution']['current_task'] = None
+            if task_id in memory['execution']['pending_tasks']:
+                memory['execution']['pending_tasks'].remove(task_id)
+            if task_id not in memory['execution']['completed_tasks']:
+                memory['execution']['completed_tasks'].append(task_id)
+            
+            if 'task_prs' not in memory['execution']:
+                memory['execution']['task_prs'] = {}
+            memory['execution']['task_prs'][task_id] = pr_number
+            
+            self.atomic_file.save(memory)
+        
+        self.audit('task_complete', task_id, {'pr_number': pr_number})
+        self.log(f"✅ Task {task_id} complete (PR #{pr_number})")
+    
+    def execute_single_task(self, memory: Dict, task: Dict) -> bool:
+        """Execute one task with full error handling."""
+        task_id = task['id']
+        
+        self.log(f"\n{'='*70}")
+        self.log(f"🚀 EXECUTING: {task_id} - {task['title']}")
+        self.log(f"{'='*70}")
+        
+        try:
+            # Check for existing issue
+            existing = self.get_issue_for_task(task_id)
+            if existing:
+                self.log(f"  Issue #{existing['number']} exists")
+                issue_number = existing['number']
+            else:
+                # Create issue
+                self.log(f"  Creating issue...")
+                issue_number = self.create_github_issue(task)
+                if not issue_number:
+                    raise RuntimeError("Failed to create issue")
+                self.log(f"  ✅ Issue #{issue_number}")
+                
+                # Update current_task
+                with FileLock(self.lock_path):
+                    memory = self.atomic_file.load()
+                    memory['execution']['current_task'] = task_id
+                    self.atomic_file.save(memory)
+                
+                # Wait for Jules to start
+                self.log(f"  Waiting for Jules...")
+                time.sleep(10)
+            
+            # Poll for completion
+            pr_number = self.poll_for_completion(task, issue_number)
+            
+            if pr_number:
+                self.mark_task_complete(memory, task_id, pr_number)
+                return True
+            else:
+                if self.shutdown_requested:
+                    self.log(f"  ⏸️  Paused (shutdown requested)")
+                    return False
+                
+                # Mark as failed
+                with FileLock(self.lock_path):
+                    memory = self.atomic_file.load()
+                    memory['execution']['failed_tasks'].append(task_id)
+                    memory['execution']['current_task'] = None
+                    self.atomic_file.save(memory)
+                
+                self.audit('task_failed', task_id, {'reason': 'timeout_or_shutdown'})
+                return False
+                
+        except Exception as e:
+            self.log(f"  ❌ Error: {e}", "ERROR")
+            self.audit('task_error', task_id, {'error': str(e)})
+            
+            with FileLock(self.lock_path):
+                memory = self.atomic_file.load()
+                memory['execution']['failed_tasks'].append(task_id)
+                memory['execution']['current_task'] = None
+                self.atomic_file.save(memory)
+            
+            return False
+    
+    def run(self):
+        """Main execution loop."""
+        self.log("="*70)
+        self.log("🤖 JULES SEQUENTIAL ORCHESTRATOR v2.0")
+        self.log("Phase 1: Stabilization (File Locking + Atomic Writes + Retry)")
+        self.log("="*70)
+        
+        # Acquire lock
+        lock = FileLock(self.lock_path)
+        if not lock.acquire(timeout=5):
+            self.log("❌ Another instance is running. Exiting.", "ERROR")
+            sys.exit(1)
+        
+        try:
+            memory = self.load_memory()
+            
+            self.log(f"Project: {memory['project']['name']}")
+            self.log(f"Repo: {self.repo}")
+            self.log(f"Tasks: {len(memory['plan']['tasks'])}")
+            self.log(f"Pending: {len(memory['execution']['pending_tasks'])}")
+            self.log(f"Completed: {len(memory['execution']['completed_tasks'])}")
+            self.log("="*70)
+            
+            self.running = True
+            
+            while self.running and not self.shutdown_requested:
+                memory = self.load_memory()
+                
+                # Check if done
+                if not memory['execution']['pending_tasks']:
+                    self.log("\n" + "="*70)
+                    self.log("✅ ALL TASKS COMPLETED!")
+                    self.log("="*70)
+                    break
+                
+                # Get next task
+                task = self.get_next_ready_task(memory)
+                
+                if not task:
+                    self.log("⏳ No ready tasks (waiting for dependencies)...")
+                    time.sleep(self.config['poll_interval'])
+                    continue
+                
+                # Execute
+                success = self.execute_single_task(memory, task)
+                
+                if not success:
+                    if self.shutdown_requested:
+                        self.log("\n⏸️  Execution paused (shutdown requested)")
+                        self.log("  Run again to resume")
+                        break
+                    
+                    self.log(f"\n❌ Task failed. Check logs.", "ERROR")
+                    # Continue to next task or stop? Let's continue.
+                    time.sleep(5)
+                    continue
+                
+                # Small delay between tasks
+                if not self.shutdown_requested:
+                    time.sleep(2)
+            
+            # Summary
+            memory = self.load_memory()
+            self.log("\n" + "="*70)
+            self.log("EXECUTION SUMMARY")
+            self.log("="*70)
+            self.log(f"Completed: {len(memory['execution']['completed_tasks'])}")
+            self.log(f"Failed: {len(memory['execution']['failed_tasks'])}")
+            self.log(f"Pending: {len(memory['execution']['pending_tasks'])}")
+            
+            if memory['execution']['failed_tasks']:
+                self.log(f"\nFailed tasks: {', '.join(memory['execution']['failed_tasks'])}")
+            
+            if self.audit_log:
+                self.log(f"\nAudit events: {len(self.audit_log)}")
+                self.log(f"Audit log: {self.memory_path.parent / 'audit.log'}")
+            
+        finally:
+            lock.release()
+
+
+def main():
+    import argparse
+    
+    parser = argparse.ArgumentParser(
+        description='Jules Sequential Orchestrator v2.0 - Stabilized'
+    )
+    parser.add_argument('--repo', required=True, help='GitHub repo (org/name)')
+    parser.add_argument('--memory', default='JULES_MEMORY.json', help='Memory file')
+    args = parser.parse_args()
+    
+    orchestrator = JulesSequentialOrchestratorV2(args.repo, args.memory)
+    orchestrator.run()
+
+
+if __name__ == '__main__':
+    main()

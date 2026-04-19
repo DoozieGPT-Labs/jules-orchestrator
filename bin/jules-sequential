@@ -1,0 +1,381 @@
+#!/usr/bin/env python3
+"""
+Jules Sequential Orchestrator v1.0
+Processes ONE task at a time, waits for completion, then triggers next.
+Installed globally in Kilo at ~/.config/kilo/skill/jules-orchestrator/bin/jules-sequential
+"""
+
+import json
+import subprocess
+import time
+import sys
+import os
+import re
+from datetime import datetime
+from pathlib import Path
+from typing import Dict, List, Optional, Set
+
+
+class JulesSequentialOrchestrator:
+    """
+    Sequential task executor - creates ONE issue at a time,
+    polls for Jules completion, then triggers next task.
+    """
+    
+    def __init__(self, repo: str, memory_file: str = "JULES_MEMORY.json"):
+        self.repo = repo
+        self.memory_file = Path(memory_file)
+        self.check_interval = 30  # seconds
+        self.running = False
+        
+    def log(self, message: str, level: str = "INFO"):
+        """Log with timestamp."""
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        print(f"[{timestamp}] [{level}] {message}", flush=True)
+        
+    def load_memory(self) -> Dict:
+        """Load JULES_MEMORY.json."""
+        with open(self.memory_file) as f:
+            return json.load(f)
+    
+    def save_memory(self, memory: Dict):
+        """Save JULES_MEMORY.json."""
+        memory['updated_at'] = datetime.now().isoformat()
+        with open(self.memory_file, 'w') as f:
+            json.dump(memory, f, indent=2)
+            
+    def run_gh(self, args: List[str]) -> List:
+        """Run gh command and return JSON output."""
+        cmd = ['gh'] + args + ['--repo', self.repo]
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            return []
+        try:
+            return json.loads(result.stdout) if result.stdout else []
+        except:
+            return []
+    
+    def get_completed_task_ids(self, memory: Dict) -> Set[str]:
+        """Get IDs of completed tasks."""
+        return set(memory.get('execution', {}).get('completed_tasks', []))
+    
+    def get_next_ready_task(self, memory: Dict) -> Optional[Dict]:
+        """
+        Get ONE next task that is ready (dependencies met).
+        Returns None if no tasks ready or if a task is currently executing.
+        """
+        # Check if something is currently executing
+        current = memory.get('execution', {}).get('current_task')
+        if current:
+            self.log(f"Task {current} still in progress, waiting...")
+            return None
+        
+        completed = self.get_completed_task_ids(memory)
+        pending = memory.get('execution', {}).get('pending_tasks', [])
+        
+        # Find first ready task (respect dependency order)
+        for task in memory.get('plan', {}).get('tasks', []):
+            tid = task['id']
+            if tid not in pending:
+                continue
+            
+            deps = set(task.get('dependencies', []))
+            if deps.issubset(completed):
+                return task
+        
+        return None
+    
+    def get_issue_for_task(self, task_id: str) -> Optional[Dict]:
+        """Find GitHub issue for task."""
+        result = self.run_gh(['issue', 'list', '--search', f'[AUTO][{task_id}]', 
+                              '--state', 'all', '--json', 
+                              'number,title,state,labels,comments'])
+        return result[0] if result else None
+    
+    def get_pr_for_issue(self, issue_number: int) -> Optional[Dict]:
+        """Find PR created by Jules for this issue."""
+        result = self.run_gh(['pr', 'list', '--state', 'all', '--search',
+                              f'#{issue_number}', '--json',
+                              'number,title,state,author,merged,headRefName'])
+        if result:
+            for pr in result:
+                # Check if it's from Jules
+                if pr.get('author', {}).get('login') == 'google-labs-jules':
+                    return pr
+        return None
+    
+    def check_jules_status(self, issue: Dict) -> Dict:
+        """Check if Jules completed the task."""
+        for comment in issue.get('comments', []):
+            author = comment.get('author', {}).get('login', '')
+            if author == 'google-labs-jules':
+                body = comment.get('body', '')
+                
+                # Jules completed - look for PR reference
+                pr_match = re.search(r'#(\d+)', body)
+                if pr_match:
+                    return {
+                        'status': 'completed',
+                        'pr_number': int(pr_match.group(1)),
+                        'has_pr': True
+                    }
+                elif 'on it' in body.lower():
+                    return {'status': 'in_progress', 'has_pr': False}
+        
+        return {'status': 'unknown', 'has_pr': False}
+    
+    def create_github_issue(self, task: Dict) -> Optional[int]:
+        """Create GitHub issue with jules label to trigger Jules."""
+        title = f"[AUTO][{task['id']}] {task['title']}"
+        
+        body = f"""## Task Definition
+- **ID**: {task['id']}
+- **Type**: {task['type']}
+- **Priority**: High
+
+## Description
+{task['description']}
+
+## Expected Files
+"""
+        for f in task.get('files_expected', []):
+            body += f"- `{f}`\n"
+        
+        body += "\n## Acceptance Criteria\n"
+        for i, criteria in enumerate(task.get('acceptance_criteria', []), 1):
+            body += f"{i}. {criteria}\n"
+        
+        body += "\n## Test Cases\n"
+        for i, test in enumerate(task.get('test_cases', []), 1):
+            body += f"{i}. {test}\n"
+        
+        deps = task.get('dependencies', [])
+        if deps:
+            body += f"\n## Dependencies\n"
+            completed = self.get_completed_task_ids(memory)
+            for dep in deps:
+                status = "✅" if dep in completed else "⏳"
+                body += f"- {dep} {status}\n"
+        
+        body += """
+## Jules Instructions
+**CRITICAL**: Execute EXACTLY as specified. Do not expand scope.
+
+---
+*Generated by Jules Sequential Orchestrator*
+"""
+        
+        cmd = ['gh', 'issue', 'create', '--repo', self.repo,
+               '--title', title, '--body', body, '--label', 'jules']
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        
+        if result.returncode == 0:
+            url = result.stdout.strip()
+            match = re.search(r'/issues/(\d+)', url)
+            if match:
+                return int(match.group(1))
+        
+        self.log(f"Failed to create issue: {result.stderr}", "ERROR")
+        return None
+    
+    def merge_pr(self, pr_number: int) -> bool:
+        """Auto-merge PR."""
+        cmd = ['gh', 'pr', 'merge', str(pr_number), '--repo', self.repo,
+               '--squash', '--delete-branch']
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        return result.returncode == 0
+    
+    def mark_task_complete(self, memory: Dict, task_id: str, pr_number: int):
+        """Mark task as complete in memory."""
+        memory['execution']['current_task'] = None
+        if task_id in memory['execution']['pending_tasks']:
+            memory['execution']['pending_tasks'].remove(task_id)
+        if task_id not in memory['execution']['completed_tasks']:
+            memory['execution']['completed_tasks'].append(task_id)
+        
+        if 'task_prs' not in memory['execution']:
+            memory['execution']['task_prs'] = {}
+        memory['execution']['task_prs'][task_id] = pr_number
+        
+        self.save_memory(memory)
+        self.log(f"✅ Task {task_id} marked complete (PR #{pr_number})")
+    
+    def poll_for_completion(self, task: Dict, issue: Dict) -> Optional[int]:
+        """
+        Poll GitHub until Jules completes the task.
+        Returns PR number when complete, None on failure.
+        """
+        task_id = task['id']
+        issue_number = issue['number']
+        
+        self.log(f"Polling for Jules completion of {task_id}...")
+        
+        start_time = time.time()
+        timeout_seconds = 15 * 60  # 15 minute timeout
+        
+        while time.time() - start_time < timeout_seconds:
+            # Refresh issue data
+            fresh_issue = self.get_issue_for_task(task_id)
+            if not fresh_issue:
+                time.sleep(self.check_interval)
+                continue
+            
+            # Check Jules status
+            status = self.check_jules_status(fresh_issue)
+            
+            if status['status'] == 'in_progress':
+                self.log(f"  ⏳ Jules still working on {task_id}...")
+            
+            elif status['status'] == 'completed':
+                pr_number = status.get('pr_number')
+                
+                if not pr_number:
+                    # Try to find PR
+                    pr = self.get_pr_for_issue(issue_number)
+                    if pr:
+                        pr_number = pr['number']
+                
+                if pr_number:
+                    # Check if PR is merged
+                    pr = self.get_pr_for_issue(issue_number)
+                    if pr:
+                        if pr.get('merged'):
+                            self.log(f"  ✅ PR #{pr_number} already merged")
+                            return pr_number
+                        elif pr.get('state') == 'OPEN':
+                            self.log(f"  🔍 PR #{pr_number} open, merging...")
+                            if self.merge_pr(pr_number):
+                                self.log(f"  ✅ PR #{pr_number} merged")
+                                return pr_number
+                            else:
+                                self.log(f"  ⚠️  Manual merge required for PR #{pr_number}")
+                                return pr_number
+                else:
+                    self.log(f"  ⚠️  Jules marked complete but no PR found", "WARN")
+                    return None
+            
+            time.sleep(self.check_interval)
+        
+        self.log(f"  ❌ Timeout waiting for Jules to complete {task_id}", "ERROR")
+        return None
+    
+    def execute_single_task(self, memory: Dict, task: Dict) -> bool:
+        """
+        Execute ONE task: create issue, wait for Jules, merge PR, mark complete.
+        Returns True on success.
+        """
+        task_id = task['id']
+        
+        self.log(f"\n{'='*70}")
+        self.log(f"🚀 EXECUTING TASK: {task_id} - {task['title']}")
+        self.log(f"{'='*70}")
+        
+        # Check if already has issue
+        existing = self.get_issue_for_task(task_id)
+        if existing:
+            self.log(f"  Issue #{existing['number']} exists, checking status...")
+            issue_number = existing['number']
+        else:
+            # Create issue (triggers Jules)
+            self.log(f"  Creating GitHub issue with 'jules' label...")
+            issue_number = self.create_github_issue(task)
+            if not issue_number:
+                return False
+            self.log(f"  ✅ Issue #{issue_number} created")
+            
+            # Update memory
+            memory['execution']['current_task'] = task_id
+            self.save_memory(memory)
+            
+            # Wait for Jules to pick it up
+            self.log(f"  Waiting 10s for Jules to trigger...")
+            time.sleep(10)
+        
+        # Poll for completion
+        pr_number = self.poll_for_completion(task, existing or {'number': issue_number})
+        
+        if pr_number:
+            self.mark_task_complete(memory, task_id, pr_number)
+            return True
+        else:
+            memory['execution']['failed_tasks'].append(task_id)
+            memory['execution']['current_task'] = None
+            self.save_memory(memory)
+            return False
+    
+    def run(self):
+        """Main sequential execution loop."""
+        self.log("="*70)
+        self.log("🤖 JULES SEQUENTIAL ORCHESTRATOR v1.0")
+        self.log("="*70)
+        self.log(f"Repo: {self.repo}")
+        self.log(f"Poll interval: {self.check_interval}s")
+        
+        self.memory = self.load_memory()
+        
+        self.log(f"Project: {self.memory['project']['name']}")
+        self.log(f"Total tasks: {len(self.memory['plan']['tasks'])}")
+        self.log(f"Pending: {len(self.memory['execution']['pending_tasks'])}")
+        self.log(f"Completed: {len(self.memory['execution']['completed_tasks'])}")
+        self.log("="*70)
+        
+        self.running = True
+        
+        try:
+            while self.running:
+                self.memory = self.load_memory()  # Refresh
+                
+                # Check if done
+                if not self.memory['execution']['pending_tasks']:
+                    self.log("\n" + "="*70)
+                    self.log("✅ ALL TASKS COMPLETED!")
+                    self.log("="*70)
+                    break
+                
+                # Get ONE ready task
+                task = self.get_next_ready_task(self.memory)
+                
+                if not task:
+                    self.log("⏳ No tasks ready (dependencies pending), checking again in 30s...")
+                    time.sleep(self.check_interval)
+                    continue
+                
+                # Execute this task
+                success = self.execute_single_task(self.memory, task)
+                
+                if not success:
+                    self.log(f"\n❌ Task {task['id']} failed. Stopping.", "ERROR")
+                    break
+                
+                # Wait before next task
+                self.log(f"\n  Waiting 5s before next task...")
+                time.sleep(5)
+                
+        except KeyboardInterrupt:
+            self.log("\n👋 Stopped by user")
+            
+        # Summary
+        self.log("\n" + "="*70)
+        self.log("EXECUTION SUMMARY")
+        self.log("="*70)
+        self.log(f"Completed: {len(self.memory['execution']['completed_tasks'])}")
+        self.log(f"Failed: {len(self.memory['execution']['failed_tasks'])}")
+        self.log(f"Pending: {len(self.memory['execution']['pending_tasks'])}")
+
+
+def main():
+    import argparse
+    
+    parser = argparse.ArgumentParser(
+        description='Jules Sequential Orchestrator - One task at a time'
+    )
+    parser.add_argument('--repo', required=True, help='GitHub repo (org/name)')
+    parser.add_argument('--memory', default='JULES_MEMORY.json', help='Memory file')
+    args = parser.parse_args()
+    
+    orchestrator = JulesSequentialOrchestrator(args.repo, args.memory)
+    orchestrator.run()
+
+
+if __name__ == '__main__':
+    main()
